@@ -1,7 +1,7 @@
 [package]
 name = "pdb-parser"
-version.workspace = true
-edition.workspace = true
+version = "0.1.0"
+edition = "2024"
 
 [dependencies]
 clap = { version = "4.5.41", features = ["derive", "env"] }
@@ -14,5 +14,8 @@ bitflags = "2.9.2"
 chrono = "0.4.42"
 uuid = { version = "1.18.1", features = ["v4"] }
 
-[lints]
-workspace = true
+[lints.clippy]
+collapsible_if = "allow"
+manual_is_multiple_of = "allow"
+new_without_default = "allow"
+useless_format = "allow"
