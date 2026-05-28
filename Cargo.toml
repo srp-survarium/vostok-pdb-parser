@@ -1,5 +1,5 @@
 [package]
-name = "pdb-parser"
+name = "vostok-pdb-parser"
 version = "0.1.0"
 edition = "2024"
 
@@ -11,6 +11,10 @@ pdb-addr2line = { git = "https://github.com/srp-survarium/pdb-addr2line", rev = 
 pdb-addr2line-orig = { package = "pdb-addr2line", version = "0.11.2" }
 
 anyhow = "1.0"
+md-5 = "0.10"
+sha1 = "0.10"
+sha2 = "0.10"
+digest = "0.10"
 bitflags = "2.9.2"
 chrono = "0.4.42"
 uuid = { version = "1.18.1", features = ["v4"] }
