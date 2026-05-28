@@ -10,23 +10,71 @@ struct Cli {
     #[arg(long, value_hint = clap::ValueHint::FilePath)]
     target_pdb: std::path::PathBuf,
 
-    /// Windows-style path prefix to strip, e.g. "c:\survarium\sources\"
+    /// Source path prefix in the base (compiled) PDB, e.g. "e:\projects\vostok\sources\vostok"
     #[arg(long)]
-    engine_path: String,
+    base_engine_path: String,
+
+    /// Source path prefix in the target (original) PDB, e.g. "c:\survarium\sources\vostok"
+    #[arg(long)]
+    target_engine_path: String,
+
+    /// Print first 20 module names and source paths from base PDB, then exit
+    #[arg(long)]
+    list: bool,
+}
+
+fn normalize_prefix(s: &str) -> String {
+    let mut p = s.to_lowercase().replace('/', "\\");
+    if !p.ends_with('\\') {
+        p.push('\\');
+    }
+    p
 }
 
 fn main() -> anyhow::Result<()> {
-    let Cli { base_pdb, target_pdb, engine_path } = Cli::parse();
+    let Cli { base_pdb, target_pdb, base_engine_path, target_engine_path, list } = Cli::parse();
 
-    let mut prefix = engine_path.to_lowercase().replace('/', "\\");
-    if !prefix.ends_with('\\') {
-        prefix.push('\\');
+    if list {
+        return list_modules(&base_pdb);
     }
 
-    let base = collect_checksums(&base_pdb, &prefix)?;
-    let target = collect_checksums(&target_pdb, &prefix)?;
+    let base   = collect_checksums(&base_pdb,   &normalize_prefix(&base_engine_path))?;
+    let target = collect_checksums(&target_pdb, &normalize_prefix(&target_engine_path))?;
 
     print_diff(&base, &target);
+    Ok(())
+}
+
+fn list_modules(path: &std::path::Path) -> anyhow::Result<()> {
+    let file = std::fs::File::open(path)?;
+    let mut pdb = pdb::PDB::open(file)?;
+    let dbi = pdb.debug_information()?;
+    let string_table = pdb.string_table()?;
+    let mut modules = dbi.modules()?;
+    let mut total = 0usize;
+    while let Some(module) = modules.next()? {
+        let name = module.module_name();
+        if total < 20 {
+            // Try to get first source file from this module
+            let src = pdb.module_info(&module).ok().flatten().and_then(|mi| {
+                let prog = mi.line_program().ok()?;
+                let mut syms = mi.symbols().ok()?;
+                loop {
+                    let sym = syms.next().ok()??;
+                    if let Ok(pdb::SymbolData::Procedure(p)) = sym.parse() {
+                        let mut lines = prog.lines_for_symbol(p.offset);
+                        if let Ok(Some(line)) = lines.next() {
+                            let fi = prog.get_file_info(line.file_index).ok()?;
+                            return fi.name.to_string_lossy(&string_table).ok().map(|s| s.to_string());
+                        }
+                    }
+                }
+            });
+            println!("{name:60}  src={}", src.as_deref().unwrap_or("(none)"));
+        }
+        total += 1;
+    }
+    println!("total modules: {total}");
     Ok(())
 }
 
@@ -50,9 +98,21 @@ fn collect_checksums(
         };
 
         let program = module_info.line_program()?;
-        let mut files = program.files();
+        let mut symbols = module_info.symbols()?;
 
-        while let Some(file_info) = files.next()? {
+        while let Some(sym) = symbols.next()? {
+            let offset = match sym.parse() {
+                Ok(pdb::SymbolData::Procedure(p)) => p.offset,
+                _ => continue,
+            };
+
+            let mut lines = program.lines_for_symbol(offset);
+            let line = match lines.next()? {
+                Some(l) => l,
+                None => continue,
+            };
+
+            let file_info = program.get_file_info(line.file_index)?;
             let name = file_info.name.to_string_lossy(&string_table)?;
             let name_lower = name.to_lowercase();
 
@@ -65,7 +125,7 @@ fn collect_checksums(
 
             let key = relative.to_owned();
             if result.contains_key(&key) {
-                continue;
+                break;
             }
 
             let checksum = match file_info.checksum {
