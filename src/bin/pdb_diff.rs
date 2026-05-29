@@ -17,9 +17,6 @@ struct Cli {
     #[command(flatten)]
     source: SourceArgs,
 
-    /// Print first 20 module names and source paths from target PDB, then exit
-    #[arg(long)]
-    list: bool,
 }
 
 #[derive(clap::Args)]
@@ -38,6 +35,41 @@ struct SourceArgs {
     source_dir: Option<PathBuf>,
 }
 
+#[derive(Clone, PartialEq)]
+enum FileChecksum {
+    None,
+    Md5(Vec<u8>),
+    Sha1(Vec<u8>),
+    Sha256(Vec<u8>),
+}
+
+impl FileChecksum {
+    fn from_pdb(c: pdb::FileChecksum<'_>) -> Self {
+        match c {
+            pdb::FileChecksum::None => FileChecksum::None,
+            pdb::FileChecksum::Md5(b) => FileChecksum::Md5(b.to_vec()),
+            pdb::FileChecksum::Sha1(b) => FileChecksum::Sha1(b.to_vec()),
+            pdb::FileChecksum::Sha256(b) => FileChecksum::Sha256(b.to_vec()),
+        }
+    }
+
+    fn hash(&self, data: &[u8]) -> FileChecksum {
+        match self {
+            FileChecksum::None => FileChecksum::None,
+            FileChecksum::Md5(_) => FileChecksum::Md5(md5_of(data)),
+            FileChecksum::Sha1(_) => FileChecksum::Sha1(sha1_of(data)),
+            FileChecksum::Sha256(_) => FileChecksum::Sha256(sha256_of(data)),
+        }
+    }
+}
+
+fn is_source_file(name: &str) -> bool {
+    name.ends_with(".cpp")
+        || name.ends_with(".cxx")
+        || name.ends_with(".c++")
+        || name.ends_with(".c")
+}
+
 fn normalize_prefix(s: &str) -> String {
     let mut p = s.to_lowercase().replace('/', "\\");
     if !p.ends_with('\\') {
@@ -47,11 +79,11 @@ fn normalize_prefix(s: &str) -> String {
 }
 
 fn main() -> anyhow::Result<()> {
-    let Cli { target_pdb, target_engine_path, source, list } = Cli::parse();
-
-    if list {
-        return list_modules(&target_pdb, &normalize_prefix(&target_engine_path));
-    }
+    let Cli {
+        target_pdb,
+        target_engine_path,
+        source,
+    } = Cli::parse();
 
     let target = collect_checksums_from_pdb(&target_pdb, &normalize_prefix(&target_engine_path))?;
 
@@ -70,18 +102,18 @@ fn main() -> anyhow::Result<()> {
 
 // ── PDB mode ─────────────────────────────────────────────────────────────────
 
-/// Returns a map of lowercased engine-relative .cpp path → raw checksum bytes.
+/// Returns a map of lowercased engine-relative source path → FileChecksum.
 fn collect_checksums_from_pdb(
     path: &Path,
     engine_prefix: &str,
-) -> anyhow::Result<HashMap<String, Vec<u8>>> {
+) -> anyhow::Result<HashMap<String, FileChecksum>> {
     let file = std::fs::File::open(path)?;
     let mut pdb = pdb::PDB::open(file)?;
 
     let string_table = pdb.string_table()?;
     let dbi = pdb.debug_information()?;
 
-    let mut result: HashMap<String, Vec<u8>> = HashMap::new();
+    let mut result: HashMap<String, FileChecksum> = HashMap::new();
     let mut modules = dbi.modules()?;
 
     while let Some(module) = modules.next()? {
@@ -108,7 +140,7 @@ fn collect_checksums_from_pdb(
             let name = file_info.name.to_string_lossy(&string_table)?;
             let name_lower = name.to_lowercase();
 
-            if !name_lower.ends_with(".cpp") {
+            if !is_source_file(&name_lower) {
                 continue;
             }
             let Some(relative) = name_lower.strip_prefix(engine_prefix) else {
@@ -120,12 +152,10 @@ fn collect_checksums_from_pdb(
                 break;
             }
 
-            let checksum = match file_info.checksum {
-                pdb::FileChecksum::None => vec![],
-                pdb::FileChecksum::Md5(b) => b.to_vec(),
-                pdb::FileChecksum::Sha1(b) => b.to_vec(),
-                pdb::FileChecksum::Sha256(b) => b.to_vec(),
-            };
+            let checksum = FileChecksum::from_pdb(file_info.checksum);
+            if matches!(checksum, FileChecksum::None) {
+                eprintln!("warning: empty checksum for {key}");
+            }
 
             result.insert(key, checksum);
             break;
@@ -145,7 +175,9 @@ fn build_case_index(root: &Path) -> HashMap<String, std::path::PathBuf> {
     let root_len = root.to_string_lossy().len();
     let mut stack = vec![root.to_path_buf()];
     while let Some(dir) = stack.pop() {
-        let Ok(entries) = std::fs::read_dir(&dir) else { continue };
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
         for entry in entries.flatten() {
             let path = entry.path();
             if path.is_dir() {
@@ -162,39 +194,38 @@ fn build_case_index(root: &Path) -> HashMap<String, std::path::PathBuf> {
 }
 
 /// For each file in target, compute its checksum from disk using the same
-/// algorithm the target PDB used (detected from checksum length).
+/// algorithm the target PDB used (taken from the FileChecksum variant).
 fn collect_checksums_from_dir(
     source_dir: &Path,
-    target: &HashMap<String, Vec<u8>>,
-) -> anyhow::Result<HashMap<String, Vec<u8>>> {
+    target: &HashMap<String, FileChecksum>,
+) -> anyhow::Result<HashMap<String, FileChecksum>> {
     let index = build_case_index(source_dir);
     let mut result = HashMap::new();
 
     for (rel_path, expected) in target {
+        if matches!(expected, FileChecksum::None) {
+            result.insert(rel_path.clone(), FileChecksum::None);
+            continue;
+        }
+
         let lookup = rel_path.replace('\\', "/");
-        let Some(fs_path) = index.get(&lookup) else { continue };
+        let Some(fs_path) = index.get(&lookup) else {
+            continue;
+        };
 
         let data = match std::fs::read(fs_path) {
             Ok(d) => d,
             Err(_) => continue,
         };
 
-        let hash_fn: fn(&[u8]) -> Vec<u8> = match expected.len() {
-            16 => md5_of,
-            20 => sha1_of,
-            32 => sha256_of,
-            0  => { result.insert(rel_path.clone(), vec![]); continue; }
-            _  => continue,
-        };
-
         // Try LF first; if mismatch, retry with CRLF (Windows build machines store
         // checksums of CRLF content, but our checkout is LF-only).
-        let lf_hash = hash_fn(&data);
-        if &lf_hash == expected {
-            result.insert(rel_path.clone(), lf_hash);
+        let lf_checksum = expected.hash(&data);
+        if &lf_checksum == expected {
+            result.insert(rel_path.clone(), lf_checksum);
         } else {
             let crlf_data = lf_to_crlf(&data);
-            result.insert(rel_path.clone(), hash_fn(&crlf_data));
+            result.insert(rel_path.clone(), expected.hash(&crlf_data));
         }
     }
 
@@ -226,47 +257,9 @@ fn sha256_of(data: &[u8]) -> Vec<u8> {
     sha2::Sha256::digest(data).to_vec()
 }
 
-// ── List mode ─────────────────────────────────────────────────────────────────
-
-fn list_modules(path: &Path, engine_prefix: &str) -> anyhow::Result<()> {
-    let file = std::fs::File::open(path)?;
-    let mut pdb = pdb::PDB::open(file)?;
-    let dbi = pdb.debug_information()?;
-    let string_table = pdb.string_table()?;
-    let mut modules = dbi.modules()?;
-    let mut total = 0usize;
-    while let Some(module) = modules.next()? {
-        let name = module.module_name();
-        if total < 20 {
-            let src = pdb.module_info(&module).ok().flatten().and_then(|mi| {
-                let prog = mi.line_program().ok()?;
-                let mut syms = mi.symbols().ok()?;
-                loop {
-                    let sym = syms.next().ok()??;
-                    if let Ok(pdb::SymbolData::Procedure(p)) = sym.parse() {
-                        let mut lines = prog.lines_for_symbol(p.offset);
-                        if let Ok(Some(line)) = lines.next() {
-                            let fi = prog.get_file_info(line.file_index).ok()?;
-                            let raw = fi.name.to_string_lossy(&string_table).ok()?;
-                            let raw = raw.to_lowercase();
-                            return Some(raw.strip_prefix(engine_prefix)
-                                .unwrap_or(&raw)
-                                .replace('\\', "/"));
-                        }
-                    }
-                }
-            });
-            println!("{name:60}  src={}", src.as_deref().unwrap_or("(none)"));
-        }
-        total += 1;
-    }
-    println!("total modules: {total}");
-    Ok(())
-}
-
 // ── Diff output ───────────────────────────────────────────────────────────────
 
-fn print_diff(base: &HashMap<String, Vec<u8>>, target: &HashMap<String, Vec<u8>>) {
+fn print_diff(base: &HashMap<String, FileChecksum>, target: &HashMap<String, FileChecksum>) {
     let mut all_keys: Vec<&String> = base.keys().chain(target.keys()).collect();
     all_keys.sort();
     all_keys.dedup();
@@ -276,10 +269,22 @@ fn print_diff(base: &HashMap<String, Vec<u8>>, target: &HashMap<String, Vec<u8>>
     for key in &all_keys {
         let name = key.replace('\\', "/");
         match (base.get(*key), target.get(*key)) {
-            (Some(b), Some(t)) if b == t => { n_match  += 1; println!("MATCH   {name}"); }
-            (Some(_), Some(_))           => { n_diff   += 1; println!("DIFF    {name}"); }
-            (Some(_), None)              => { n_base   += 1; println!("BASE    {name}"); }
-            (None, Some(_))              => { n_target += 1; println!("TARGET  {name}"); }
+            (Some(b), Some(t)) if b == t => {
+                n_match += 1;
+                println!("MATCH   {name}");
+            }
+            (Some(_), Some(_)) => {
+                n_diff += 1;
+                println!("DIFF    {name}");
+            }
+            (Some(_), None) => {
+                n_base += 1;
+                println!("BASE    {name}");
+            }
+            (None, Some(_)) => {
+                n_target += 1;
+                println!("TARGET  {name}");
+            }
             (None, None) => unreachable!(),
         }
     }
