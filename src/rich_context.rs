@@ -45,6 +45,24 @@ pub struct SymbolMaps {
     pub data: BTreeMap<usize, String>,
 }
 
+/// One function's rendered listing plus its lookup keys. Serialized one-per-line
+/// into `<out>/index.jsonl` during a full build; the query tool reads that file
+/// and returns a function's `block` without re-parsing the PDB ("rebuild
+/// completely, then query on top of that").
+#[derive(serde::Serialize, serde::Deserialize)]
+pub struct FunctionEntry {
+    /// Full demangled signature (the block's first line, sans trailing `:`).
+    pub name: String,
+    /// Function RVA (image-relative) — the merge key shared with the line program.
+    pub rva: u32,
+    /// Function length in bytes.
+    pub size: u32,
+    /// Source file, `/`-separated (engine-relative in tree mode).
+    pub file: String,
+    /// The rendered disasm-interleaved-with-source block.
+    pub block: String,
+}
+
 pub struct Options {
     /// Recorded source-path prefix to strip (lowercased, `\`-separated, trailing
     /// `\`), e.g. `c:\survarium\sources\`. Used to identify engine files and to
@@ -88,8 +106,7 @@ pub fn dump_rich_context(pdb_path: &Path, exe_path: &Path, opts: &Options) -> cr
 
         let symbols = Rc::new(build_symbol_maps(&mut pdb, &address_map)?);
 
-        // file path -> (function rva -> rendered block)
-        let mut by_file: BTreeMap<String, BTreeMap<u32, String>> = BTreeMap::new();
+        let mut entries: Vec<FunctionEntry> = Vec::new();
         let mut source_cache: HashMap<String, Option<Vec<String>>> = HashMap::new();
 
         let dbi = pdb.debug_information()?;
@@ -168,28 +185,39 @@ pub fn dump_rich_context(pdb_path: &Path, exe_path: &Path, opts: &Options) -> cr
                     _ => None,
                 };
 
+                let signature = fmt
+                    .emit_function_orig(&proc.name, module_id, proc.type_index)
+                    .unwrap_or_else(|_| proc.name.to_string().into_owned());
+
                 let block = render_function(
-                    &fmt,
+                    &signature,
                     &symbols,
                     image_base,
                     text_rva,
                     &text_data,
-                    module_id,
-                    &proc,
                     func_rva,
                     size,
                     &stmts,
                     src_lines,
                 );
 
-                let key = rel.unwrap_or(file_name);
-                by_file.entry(key).or_default().insert(func_rva as u32, block);
+                let file = rel.unwrap_or(file_name).replace('\\', "/");
+                entries.push(FunctionEntry {
+                    name: signature,
+                    rva: func_rva as u32,
+                    size: size as u32,
+                    file,
+                    block,
+                });
             }
         }
 
         match &opts.out_dir {
-            None => write_stdout(&by_file)?,
-            Some(dir) => write_tree(dir, by_file)?,
+            None => write_stdout(&entries)?,
+            Some(dir) => {
+                write_tree(dir, &entries)?;
+                write_index(dir, &entries)?;
+            }
         }
 
         Ok(())
@@ -198,13 +226,11 @@ pub fn dump_rich_context(pdb_path: &Path, exe_path: &Path, opts: &Options) -> cr
 
 #[allow(clippy::too_many_arguments)]
 fn render_function(
-    fmt: &PdbParser,
+    signature: &str,
     symbols: &Rc<SymbolMaps>,
     image_base: u64,
     text_rva: usize,
     text_data: &[u8],
-    module_id: usize,
-    proc: &pdb::ProcedureSymbol,
     func_rva: usize,
     size: usize,
     stmts: &[(u32, u32)],
@@ -212,9 +238,6 @@ fn render_function(
 ) -> String {
     let mut block = String::new();
 
-    let signature = fmt
-        .emit_function_orig(&proc.name, module_id, proc.type_index)
-        .unwrap_or_else(|_| proc.name.to_string().into_owned());
     let _ = writeln!(block, "{signature}:");
 
     let off = func_rva - text_rva;
@@ -357,40 +380,61 @@ fn build_symbol_maps(
     Ok(SymbolMaps { functions, data })
 }
 
-fn write_stdout(by_file: &BTreeMap<String, BTreeMap<u32, String>>) -> crate::Result<()> {
+/// Group entries by file, each file's functions sorted by RVA — borrowed, no
+/// block copies.
+fn group_by_file(entries: &[FunctionEntry]) -> BTreeMap<&str, BTreeMap<u32, &FunctionEntry>> {
+    let mut by_file: BTreeMap<&str, BTreeMap<u32, &FunctionEntry>> = BTreeMap::new();
+    for e in entries {
+        by_file.entry(e.file.as_str()).or_default().insert(e.rva, e);
+    }
+    by_file
+}
+
+fn write_stdout(entries: &[FunctionEntry]) -> crate::Result<()> {
     let stdout = std::io::stdout();
     let mut w = stdout.lock();
-    for (file, funs) in by_file {
+    for (file, funs) in group_by_file(entries) {
         writeln!(w, "// ===== {file} =====\n")?;
-        for block in funs.values() {
-            write!(w, "{block}")?;
+        for e in funs.values() {
+            write!(w, "{}", e.block)?;
         }
     }
     Ok(())
 }
 
 /// Write the structure-style tree: `<dir>/sources/<relative path>`, one file per
-/// source file, functions in RVA order. `by_file` keys are already unique
-/// relative paths, so no collision handling is needed.
-fn write_tree(
-    dir: &Path,
-    by_file: BTreeMap<String, BTreeMap<u32, String>>,
-) -> crate::Result<()> {
+/// source file, functions in RVA order.
+fn write_tree(dir: &Path, entries: &[FunctionEntry]) -> crate::Result<()> {
     let root = dir.join("sources");
 
-    for (rel, funs) in by_file {
-        let relative = rel.replace('\\', "/");
-        let full = root.join(relative.trim_start_matches('/'));
-
+    for (file, funs) in group_by_file(entries) {
+        let full = root.join(file.trim_start_matches('/'));
         if let Some(parent) = full.parent() {
             std::fs::create_dir_all(parent)?;
         }
 
-        let mut file = std::fs::File::create(&full)?;
-        for block in funs.values() {
-            write!(file, "{block}")?;
+        let mut out = std::fs::File::create(&full)?;
+        for e in funs.values() {
+            write!(out, "{}", e.block)?;
         }
     }
+
+    Ok(())
+}
+
+/// Write the queryable index: `<dir>/index.jsonl`, one JSON `FunctionEntry` per
+/// line, sorted by (file, rva) for stable diffs. The query tool reads this
+/// without touching the PDB.
+fn write_index(dir: &Path, entries: &[FunctionEntry]) -> crate::Result<()> {
+    let mut ordered: Vec<&FunctionEntry> = entries.iter().collect();
+    ordered.sort_by(|a, b| a.file.cmp(&b.file).then(a.rva.cmp(&b.rva)));
+
+    let mut out = std::io::BufWriter::new(std::fs::File::create(dir.join("index.jsonl"))?);
+    for e in ordered {
+        serde_json::to_writer(&mut out, e)?;
+        writeln!(out)?;
+    }
+    out.flush()?;
 
     Ok(())
 }

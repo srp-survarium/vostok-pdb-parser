@@ -102,6 +102,22 @@ Smoke tests (both pass, 2026-05-30):
   `--source-root vostok/sources` — real source lines render; disasm+sizes are
   byte-identical to target for the matched `ghost_object.cpp`.
 
+13. **Query is served from a pre-built index, not a per-query PDB re-parse.**
+    (User: "always rebuild it completely and then have query on top of that";
+    "we can always optimize".) A full target rebuild measured at **~1.4 s**, so
+    the complete rebuild is cheap and stays the refresh step — no incremental /
+    caching machinery. The build now also writes `<out>/index.jsonl`: one JSON
+    `FunctionEntry { name, rva, size, file, block }` per line, sorted (file, rva).
+    New `pdb_rich_query` reads only that file:
+    * `--function <substr>` — case-insensitive signature substring (returns all
+      overloads), `--rva 0xNN` — exact, `--list` — `rva file signature` lines.
+    * Query over 24,467 target functions: **~0.13 s** → "immediately".
+    Trade-off accepted: the index duplicates the block text (target 72 MB). Fine
+    for now; obvious later optimizations (engine-preset filter, name→offset seek
+    index, demangle data symbols) deferred per "we can always optimize".
+    `render_function` was refactored to take the signature as a `&str` (computed
+    once in the caller) so the same string keys the index and heads the block.
+
 ## Decisions NOT taken (and why)
 
 1. **Did NOT refactor `vostok-delinker` into a shared library.** Tempting (would
