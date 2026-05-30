@@ -564,7 +564,12 @@ impl<'a> Module<'a> {
                 () => "",
             };
 
-            source_path.push(path_to_file);
+            // Recorded source paths use `\` separators; split them into real
+            // folders instead of writing one flat `a\b\c.cpp` filename. Keep the
+            // result relative (trim any leading separator) so PathBuf::push nests
+            // under `sources/` rather than resetting to an absolute path.
+            let relative = path_to_file.replace('\\', "/");
+            source_path.push(relative.trim_start_matches('/'));
             let mut file = utils_fs::open_file(output_path, source_path, files, extension)?;
 
             //
