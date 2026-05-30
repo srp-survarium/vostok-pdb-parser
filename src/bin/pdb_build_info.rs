@@ -57,6 +57,10 @@ struct Compiland {
     cmd: Option<String>,
     flags: Option<pdb::CompileFlags>,
     version: String,
+    /// Compiler backend (codegen) build number from S_COMPILE2/3 - this is the
+    /// value that distinguishes RTM (21022) from SP1 (30729), the same number
+    /// the @comp.id record carries. 0 if no S_COMPILE record was present.
+    be_build: u16,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -74,6 +78,8 @@ fn main() -> anyhow::Result<()> {
 
     if let Some(base_path) = &cli.compare {
         let base = read_compilands(base_path)?;
+        write_build_histogram(&mut buf, "TARGET", &cli.pdb, &compilands);
+        write_build_histogram(&mut buf, "BASE  ", base_path, &base);
         let target_projects = build_projects(&compilands);
         let base_projects = build_projects(&base);
         write_comparison(
@@ -121,6 +127,7 @@ fn read_compilands(path: &std::path::Path) -> anyhow::Result<Vec<Compiland>> {
 
         let mut obj_name = String::new();
         let mut version = String::new();
+        let mut be_build = 0u16;
         let mut flags = None;
         let mut cwd = String::new();
         let mut src = String::new();
@@ -132,6 +139,7 @@ fn read_compilands(path: &std::path::Path) -> anyhow::Result<Vec<Compiland>> {
                 Ok(pdb::SymbolData::ObjName(o)) => obj_name = o.name.to_string().into_owned(),
                 Ok(pdb::SymbolData::CompileFlags(c)) => {
                     version = c.version_string.to_string().into_owned();
+                    be_build = c.backend_version.build;
                     flags = Some(c.flags);
                 }
                 Ok(pdb::SymbolData::EnvBlock(e)) => {
@@ -167,6 +175,7 @@ fn read_compilands(path: &std::path::Path) -> anyhow::Result<Vec<Compiland>> {
             cmd,
             flags,
             version,
+            be_build,
         });
     }
     Ok(out)
@@ -182,6 +191,19 @@ struct Project {
     flag_sets: BTreeMap<String, String>,
     no_cmd: usize,
     coarse: BTreeSet<String>,
+    /// distinct compiler backend build numbers across the project's compilands
+    /// (RTM 21022 vs SP1 30729). 0 (no S_COMPILE record) is not collected.
+    builds: BTreeSet<u16>,
+}
+
+impl Project {
+    fn builds_str(&self) -> String {
+        if self.builds.is_empty() {
+            "—".into()
+        } else {
+            self.builds.iter().map(u16::to_string).collect::<Vec<_>>().join(",")
+        }
+    }
 }
 
 impl Project {
@@ -245,6 +267,9 @@ fn build_projects(compilands: &[Compiland]) -> BTreeMap<String, Project> {
                 p.coarse.insert(coarse_summary(f));
             }
         }
+        if c.be_build != 0 {
+            p.builds.insert(c.be_build);
+        }
         if p.lib.is_empty() || c.object_file_name.to_lowercase().ends_with(".lib") {
             p.lib = c.object_file_name.clone();
         }
@@ -280,6 +305,32 @@ fn write_report(buf: &mut String, projects: &BTreeMap<String, Project>, full: bo
 
 // ── comparison report (report-2) ────────────────────────────────────────────────
 
+/// Per-PDB histogram of compiler backend build numbers. The whole point of the
+/// SP1-CRT toolchain work: a healthy base has *no* RTM (21022) compilands left.
+fn write_build_histogram(
+    buf: &mut String,
+    label: &str,
+    path: &std::path::Path,
+    compilands: &[Compiland],
+) {
+    let mut hist: BTreeMap<u16, usize> = BTreeMap::new();
+    for c in compilands {
+        if c.be_build != 0 {
+            *hist.entry(c.be_build).or_default() += 1;
+        }
+    }
+    let _ = writeln!(buf, "{label} backend-build histogram ({})", path.display());
+    for (b, n) in &hist {
+        let tag = match *b {
+            21022 => " (RTM)",
+            30729 => " (SP1)",
+            _ => "",
+        };
+        let _ = writeln!(buf, "    build {b}{tag}: {n} compiland(s)");
+    }
+    let _ = writeln!(buf);
+}
+
 fn write_comparison(
     buf: &mut String,
     target_path: &std::path::Path,
@@ -310,7 +361,13 @@ fn write_comparison(
         let b = &base[*n];
         let t_has = !t.flag_sets.is_empty();
         let b_has = !b.flag_sets.is_empty();
-        let status = if t.config() == b.config() {
+        // A backend build-number difference (RTM 21022 vs SP1 30729) is the most
+        // important mismatch to surface - it means the two sides linked objects
+        // built by different compiler builds - so check it before flags.
+        let ver_diff = !t.builds.is_empty() && !b.builds.is_empty() && t.builds != b.builds;
+        let status = if ver_diff {
+            "DIFF-VER"
+        } else if t.config() == b.config() {
             "MATCH"
         } else if t_has && b_has && t.crt() != b.crt() {
             "DIFF-CRT"
@@ -322,8 +379,8 @@ fn write_comparison(
             "DIFF-FLAGS"
         };
         let _ = writeln!(buf, "── {n}   [{status}]   (target {} src / base {} src)", t.source_count(), b.source_count());
-        let _ = writeln!(buf, "     target: {}", t.config());
-        let _ = writeln!(buf, "     base  : {}", b.config());
+        let _ = writeln!(buf, "     target: builds[{}]  {}", t.builds_str(), t.config());
+        let _ = writeln!(buf, "     base  : builds[{}]  {}", b.builds_str(), b.config());
         if full {
             for (i, raw) in t.flag_sets.values().enumerate() {
                 let _ = writeln!(buf, "       target cmd[{i}]: {raw}");
@@ -369,7 +426,7 @@ fn dump(compilands: &[Compiland], explore: Option<usize>, grep: Option<&str>) {
         println!("object_file : {}", c.object_file_name);
         println!("obj         : {}", c.obj_name);
         println!("source      : {}", c.source.as_deref().unwrap_or("<none>"));
-        println!("compiler    : {}", c.version);
+        println!("compiler    : {}  (backend build {})", c.version, c.be_build);
         if let Some(f) = c.flags {
             println!("compile3    : {f:?}");
         }
