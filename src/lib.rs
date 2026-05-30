@@ -9,7 +9,9 @@ pub mod gen_sources;
 
 pub mod disasm;
 pub mod rich_context;
+pub mod rich_diff;
 pub mod rich_query;
+pub mod rich_render;
 
 pub mod formatter;
 pub mod helpers;

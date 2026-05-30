@@ -14,6 +14,7 @@ use std::path::PathBuf;
 use clap::Parser;
 
 use vostok_pdb_parser::rich_query::{search, Query};
+use vostok_pdb_parser::rich_render::render_listing;
 
 #[derive(Parser)]
 struct Cli {
@@ -67,7 +68,7 @@ fn main() {
         if cli.list {
             println!("0x{:06x}  {}\t{}", e.rva, e.file, e.name);
         } else {
-            print!("{}", e.block);
+            print!("{}", render_listing(e));
         }
     }
 }

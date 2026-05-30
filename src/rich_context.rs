@@ -1,5 +1,5 @@
-//! `pdb_rich_context` core: emit, per engine function, a block that interleaves
-//! the disassembly with the source-level statements that produced it.
+//! `pdb_rich_context` core: build, per engine function, a *structured* record
+//! that pairs the disassembly with the source-level statements that produced it.
 //!
 //! The two halves come from existing tooling:
 //!   * **source half** — the PDB line program gives, per function, a sequence of
@@ -10,17 +10,20 @@
 //!
 //! Both are keyed by the *same* RVA (`proc.offset.to_rva`), so mapping
 //! instructions to statements is an exact sorted merge: each statement owns the
-//! instructions in `[its_rva, next_statement_rva)`, and its `; 0xNN` annotation
-//! is that byte span. Instructions before the first statement (prologue) and any
-//! inlined-call bytes fall naturally under the enclosing statement.
+//! instructions in `[its_rva, next_statement_rva)`, and its size is that span.
 //!
-//! Base vs target differ only in the statement text: base reads the real source
-//! line from disk; target (the original game, no sources) prints the line number
-//! as `'<line>'`. Offsets, sizes, labels and disassembly are identical.
+//! We deliberately store this as **structured data** ([`FunctionEntry`]), not a
+//! pre-rendered string: the query/fetch tools render it into whichever view is
+//! asked for (full listing, structure-only, or a base↔target diff computed on
+//! the raw instruction text *before* any metadata is attached). Rendering lives
+//! in [`crate::rich_render`]; diffing in [`crate::rich_diff`].
+//!
+//! Base vs target differ only in [`Statement::source`]: base reads the real
+//! source line from disk; target (the original game, no sources) leaves it
+//! `None`. Offsets, sizes, labels and disassembly are identical.
 
 use std::collections::BTreeMap;
 use std::collections::HashMap;
-use std::fmt::Write as _;
 use std::io::Write as _;
 use std::path::Path;
 use std::path::PathBuf;
@@ -36,6 +39,7 @@ use object::{Object, ObjectSection};
 
 use crate::disasm;
 use crate::pdb_parser::PdbParser;
+use crate::rich_render;
 
 /// RVA -> recovered name, for naming call/data targets in operands. Names prefer
 /// the readable module-symbol form (`vostok::foo::bar`); public (mangled) names
@@ -45,13 +49,43 @@ pub struct SymbolMaps {
     pub data: BTreeMap<usize, String>,
 }
 
-/// One function's rendered listing plus its lookup keys. Serialized one-per-line
-/// into `<out>/index.jsonl` during a full build; the query tool reads that file
-/// and returns a function's `block` without re-parsing the PDB ("rebuild
-/// completely, then query on top of that").
+/// One decoded instruction. `text` is the rendered mnemonic+operands with branch
+/// targets resolved to local labels and call/data targets to symbol names — this
+/// is the *normalized* form the diff aligns on.
+#[derive(serde::Serialize, serde::Deserialize)]
+pub struct Instruction {
+    /// Offset from the function start.
+    pub off: u32,
+    /// Instruction length in bytes.
+    pub len: u8,
+    /// Rendered mnemonic + operands.
+    pub text: String,
+    /// Local label sitting at this offset (e.g. `.1`), if it is a branch target.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+}
+
+/// One source-level statement (a line-program boundary) and the byte span it
+/// compiled to.
+#[derive(serde::Serialize, serde::Deserialize)]
+pub struct Statement {
+    /// Offset from the function start where this statement's code begins.
+    pub off: u32,
+    /// Byte size of this statement's instruction run (span to the next statement).
+    pub size: u32,
+    /// Source line number (0 = unknown).
+    pub line: u32,
+    /// Real source text (base only; `None` for target / inlined-headerless code).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+}
+
+/// One function's full structured record, serialized one-per-line into
+/// `<out>/index.jsonl`. Base and target functions join by [`FunctionEntry::name`]
+/// (the signature is identical across the two PDBs).
 #[derive(serde::Serialize, serde::Deserialize)]
 pub struct FunctionEntry {
-    /// Full demangled signature (the block's first line, sans trailing `:`).
+    /// Full demangled signature.
     pub name: String,
     /// Function RVA (image-relative) — the merge key shared with the line program.
     pub rva: u32,
@@ -59,8 +93,10 @@ pub struct FunctionEntry {
     pub size: u32,
     /// Source file, `/`-separated (engine-relative in tree mode).
     pub file: String,
-    /// The rendered disasm-interleaved-with-source block.
-    pub block: String,
+    /// Statement boundaries, sorted by offset.
+    pub statements: Vec<Statement>,
+    /// Instructions, in address order.
+    pub instructions: Vec<Instruction>,
 }
 
 pub struct Options {
@@ -69,13 +105,13 @@ pub struct Options {
     /// build relative paths for the output tree.
     pub engine_path: String,
     /// Local directory the engine sources actually live in (base mode). When set,
-    /// statement text is read from `source_root / <relative path>`; on a miss we
-    /// fall back to the `'<line>'` placeholder.
+    /// statement text is read from `source_root / <relative path>`; on a miss the
+    /// statement keeps `source: None`.
     pub source_root: Option<PathBuf>,
     /// Target mode = original game, no sources: never attempt source reads.
     pub target_mode: bool,
-    /// Output directory for the structure-style tree. `None` => single stream to
-    /// stdout (all functions, unfiltered — handy for inspection / target smoke).
+    /// Output directory for the structure-style tree + index. `None` => render a
+    /// single stream to stdout (all functions, unfiltered — handy for inspection).
     pub out_dir: Option<PathBuf>,
 }
 
@@ -163,9 +199,7 @@ pub fn dump_rich_context(pdb_path: &Path, exe_path: &Path, opts: &Options) -> cr
 
                 let file_name = file_name.unwrap_or_default();
                 let lower = file_name.to_lowercase().replace('/', "\\");
-                let rel = lower
-                    .strip_prefix(&opts.engine_path)
-                    .map(|s| s.to_string());
+                let rel = lower.strip_prefix(&opts.engine_path).map(|s| s.to_string());
 
                 // Tree output only carries engine files; stdout carries all.
                 if opts.out_dir.is_some() && rel.is_none() {
@@ -189,26 +223,12 @@ pub fn dump_rich_context(pdb_path: &Path, exe_path: &Path, opts: &Options) -> cr
                     .emit_function_orig(&proc.name, module_id, proc.type_index)
                     .unwrap_or_else(|_| proc.name.to_string().into_owned());
 
-                let block = render_function(
-                    &signature,
-                    &symbols,
-                    image_base,
-                    text_rva,
-                    &text_data,
-                    func_rva,
-                    size,
-                    &stmts,
-                    src_lines,
-                );
-
                 let file = rel.unwrap_or(file_name).replace('\\', "/");
-                entries.push(FunctionEntry {
-                    name: signature,
-                    rva: func_rva as u32,
-                    size: size as u32,
-                    file,
-                    block,
-                });
+
+                entries.push(build_function(
+                    signature, &symbols, image_base, text_rva, &text_data, func_rva, size, &stmts,
+                    src_lines, file,
+                ));
             }
         }
 
@@ -224,9 +244,11 @@ pub fn dump_rich_context(pdb_path: &Path, exe_path: &Path, opts: &Options) -> cr
     })
 }
 
+/// Decode a function's bytes + merge in its statement boundaries, producing the
+/// structured [`FunctionEntry`]. No rendering happens here.
 #[allow(clippy::too_many_arguments)]
-fn render_function(
-    signature: &str,
+fn build_function(
+    signature: String,
     symbols: &Rc<SymbolMaps>,
     image_base: u64,
     text_rva: usize,
@@ -235,17 +257,29 @@ fn render_function(
     size: usize,
     stmts: &[(u32, u32)],
     src_lines: Option<&Vec<String>>,
-) -> String {
-    let mut block = String::new();
-
-    let _ = writeln!(block, "{signature}:");
-
+    file: String,
+) -> FunctionEntry {
     let off = func_rva - text_rva;
     let code = &text_data[off..off + size];
     let va_base = image_base + func_rva as u64;
 
     let decoded = disasm::decode(code, va_base);
     let mut formatter = disasm::make_formatter(image_base, decoded.labels.clone(), symbols.clone());
+
+    let instructions = decoded
+        .instructions
+        .iter()
+        .map(|insn| {
+            let mut text = String::new();
+            formatter.format(insn, &mut text);
+            Instruction {
+                off: (insn.ip() - va_base) as u32,
+                len: insn.len() as u8,
+                text,
+                label: decoded.labels.get(&insn.ip()).cloned(),
+            }
+        })
+        .collect();
 
     let func_size = size as u32;
     let func_rva32 = func_rva as u32;
@@ -266,52 +300,32 @@ fn render_function(
     starts.sort_by_key(|(off, _)| *off);
     starts.dedup_by_key(|(off, _)| *off);
 
-    for g in 0..starts.len() {
-        let (start_off, line) = starts[g];
-        let end_off = starts.get(g + 1).map(|(off, _)| *off).unwrap_or(func_size);
-        let stmt_size = end_off.saturating_sub(start_off);
-
-        let text = src_lines
-            .filter(|_| line != 0)
-            .and_then(|lines| lines.get((line as usize).wrapping_sub(1)))
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty());
-
-        // Statement header: base shows the real source line (read via the PDB
-        // line number); target has no source, so the statement is represented by
-        // its byte size alone (the line number is noise for matching).
-        match text {
-            Some(text) => {
-                let _ = writeln!(block, "{text}\t; 0x{stmt_size:x} bytes");
+    let statements = (0..starts.len())
+        .map(|g| {
+            let (start_off, line) = starts[g];
+            let end_off = starts.get(g + 1).map(|(off, _)| *off).unwrap_or(func_size);
+            let source = src_lines
+                .filter(|_| line != 0)
+                .and_then(|lines| lines.get((line as usize).wrapping_sub(1)))
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty());
+            Statement {
+                off: start_off,
+                size: end_off.saturating_sub(start_off),
+                line,
+                source,
             }
-            // No source line — every target statement, and base statements from
-            // inlined/headerless code. Anchor by the statement's function-relative
-            // offset so it can still be located, in place of the missing source.
-            None => {
-                let _ = writeln!(block, "[0x{start_off:x}]\t; 0x{stmt_size:x} bytes");
-            }
-        }
+        })
+        .collect();
 
-        for insn in &decoded.instructions {
-            let ioff = (insn.ip() - va_base) as u32;
-            if ioff < start_off || ioff >= end_off {
-                continue;
-            }
-            if let Some(label) = decoded.labels.get(&insn.ip()) {
-                let _ = writeln!(block, "{label}:");
-            }
-            let mut text = String::new();
-            formatter.format(insn, &mut text);
-            // Per-instruction annotation is the instruction's *size* (hex, with
-            // the literal word `bytes`) so it can't be misread as an
-            // address/offset. These sum to the statement's `bytes` total above.
-            let _ = writeln!(block, "    {text}\t; 0x{:x} bytes", insn.len());
-        }
-
-        let _ = writeln!(block);
+    FunctionEntry {
+        name: signature,
+        rva: func_rva as u32,
+        size: size as u32,
+        file,
+        statements,
+        instructions,
     }
-
-    block
 }
 
 /// Build RVA -> name maps for call/data target annotation. Module symbols
@@ -380,8 +394,7 @@ fn build_symbol_maps(
     Ok(SymbolMaps { functions, data })
 }
 
-/// Group entries by file, each file's functions sorted by RVA — borrowed, no
-/// block copies.
+/// Group entries by file, each file's functions sorted by RVA — borrowed.
 fn group_by_file(entries: &[FunctionEntry]) -> BTreeMap<&str, BTreeMap<u32, &FunctionEntry>> {
     let mut by_file: BTreeMap<&str, BTreeMap<u32, &FunctionEntry>> = BTreeMap::new();
     for e in entries {
@@ -396,7 +409,7 @@ fn write_stdout(entries: &[FunctionEntry]) -> crate::Result<()> {
     for (file, funs) in group_by_file(entries) {
         writeln!(w, "// ===== {file} =====\n")?;
         for e in funs.values() {
-            write!(w, "{}", e.block)?;
+            writeln!(w, "{}", rich_render::render_listing(e))?;
         }
     }
     Ok(())
@@ -413,17 +426,18 @@ fn write_tree(dir: &Path, entries: &[FunctionEntry]) -> crate::Result<()> {
             std::fs::create_dir_all(parent)?;
         }
 
-        let mut out = std::fs::File::create(&full)?;
+        let mut out = std::io::BufWriter::new(std::fs::File::create(&full)?);
         for e in funs.values() {
-            write!(out, "{}", e.block)?;
+            writeln!(out, "{}", rich_render::render_listing(e))?;
         }
+        out.flush()?;
     }
 
     Ok(())
 }
 
-/// Write the queryable index: `<dir>/index.jsonl`, one JSON `FunctionEntry` per
-/// line, sorted by (file, rva) for stable diffs. The query tool reads this
+/// Write the queryable index: `<dir>/index.jsonl`, one JSON [`FunctionEntry`] per
+/// line, sorted by (file, rva) for stable diffs. The query/fetch tools read this
 /// without touching the PDB.
 fn write_index(dir: &Path, entries: &[FunctionEntry]) -> crate::Result<()> {
     let mut ordered: Vec<&FunctionEntry> = entries.iter().collect();
