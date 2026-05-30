@@ -141,8 +141,13 @@ dependency state location; step-2 selection policy; cache key/invalidation.
 
 ## Next steps
 
-1. `callees` / `info` views.
+1. `info` view (locals / call-site metadata the carcass already extracts);
+   optional `callees` with full bodies, not just signatures.
 2. Index compaction + carcass-comment stripping in base source text.
-3. objdiff diff: interleave the source/offset metadata back onto the rows (it is
-   currently raw asm only), and surface the structured op stream (not just text).
+3. objdiff diff: surface the structured op stream to the model (not just the
+   rendered text), and the target-side offsets too.
 4. (With the loop, later) version history + machine-readable failure log.
+
+Done since the last rewrite: objdiff source/offset interleaving (keyed by
+objdiff instruction address, robust to differing instruction splits); `callees`
+view (`rich_callees`).

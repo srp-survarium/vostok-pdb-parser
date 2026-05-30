@@ -8,6 +8,7 @@ pub mod gen_headers;
 pub mod gen_sources;
 
 pub mod disasm;
+pub mod rich_callees;
 pub mod rich_context;
 pub mod rich_diff;
 pub mod rich_objdiff;

@@ -119,7 +119,10 @@ FunctionEntry {
 - `rich_diff.rs` — built-in LCS diff over instruction text → Equal/Delete/Insert
   + match ratio; `render_unified`.
 - `rich_objdiff.rs` — operand-aware diff via `objdiff-core` over the delinker
-  `.obj`s; returns `match_percent` + an aligned listing.
+  `.obj`s; returns `match_percent` + structured rows, then interleaves base
+  source/offsets onto them.
+- `rich_callees.rs` — extract a function's `call` targets and resolve them to
+  index signatures (one streaming pass).
 - `rich_query.rs` — `search(index, {name substr, rva})`.
 - `bin/pdb_rich_context.rs` — build CLI (`--mode base|target`, `--out`).
 - `bin/pdb_rich_query.rs` — discovery: `--list` / fetch one by name|rva.
@@ -161,11 +164,11 @@ humans. Batched matching will need many diffs against target in one pass.
 | `target` | target index | offset-prefixed listing, no source |
 | `base` | base index | same listing + real source lines inline |
 | `structure` | either | statement skeleton: offset, `<size>`, line/source, no asm |
-| `diff` | both | aligned base↔target instruction diff + match ratio |
+| `diff` | both | aligned base↔target instruction diff + match ratio; the objdiff backend interleaves base source/offsets onto the rows |
+| `callees` | function's side | the function's `call` targets, each resolved to its index signature(s) |
 
-Planned views: `callees` (function + its callees' signatures/bodies, names
-already recovered in the disasm); `info` (locals/call-site metadata, as the
-carcass already extracts).
+Planned views: `info` (locals/call-site metadata, as the carcass already
+extracts); optionally `callees` with full bodies, not just signatures.
 
 ---
 

@@ -26,6 +26,7 @@ use std::path::PathBuf;
 
 use clap::Parser;
 
+use vostok_pdb_parser::rich_callees;
 use vostok_pdb_parser::rich_context::FunctionEntry;
 use vostok_pdb_parser::rich_diff;
 use vostok_pdb_parser::rich_objdiff;
@@ -155,6 +156,24 @@ fn main() {
                 Some(f) => print!("{}", render_structure(f)),
                 None => {}
             },
+            "callees" => {
+                // Resolve against the side the function came from (prefer target).
+                let (entry, index) = match &target {
+                    Some(t) => (Some(t), cli.target_index.as_deref()),
+                    None => (base.as_ref(), cli.base_index.as_deref()),
+                };
+                if let Some(f) = entry {
+                    let callees = rich_callees::extract(f);
+                    let resolved = match index {
+                        Some(p) => rich_callees::resolve(p, &callees).unwrap_or_else(|e| {
+                            eprintln!("(callee resolve failed: {e})");
+                            Default::default()
+                        }),
+                        None => Default::default(),
+                    };
+                    print!("{}", rich_callees::render(f, &callees, &resolved));
+                }
+            }
             "diff" => match (&base, &target) {
                 (Some(b), Some(t)) => print_diff(&cli, b, t),
                 _ => eprintln!("(--view diff needs both --base-index and --target-index)"),
