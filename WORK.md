@@ -159,11 +159,12 @@ right entry and skipped procedures don't leak locals onto the previous one.
 ## Session 2026-05-31: open questions resolved + loop reconciliation
 
 - Wrote `CLAUDE.md` (operator's manual, verified example output for every view).
-- **All six PLAN "Open questions" resolved with the owner** (see PLAN "DONE —
-  Resolved decisions"). Headlines: retry metric = objdiff match% + row count;
-  selection = smallest-then-topological; failure log = the loop's existing
-  STATE markers + per-function markdown (no JSONL); pragmas = out of scope;
-  cache key = deferred; clusters = diff-reactive.
+- **Five of six PLAN "Open questions" resolved with the owner** (see PLAN
+  "Decisions"). Headlines: retry metric = objdiff match% + row count; selection =
+  smallest-then-topological; failure log = the loop's existing STATE markers +
+  per-function markdown (no JSONL); cache key = deferred; clusters = diff-reactive.
+  **Pragmas kept open** — the near-term lever (fetch the asm of a suspected-inlined
+  function) is logged as a wishlist item in the loop's `unanswered_questions.md`.
 - **Cluster question settled empirically.** A throwaway `probe_inlines` bin found
   **0 `S_INLINESITE`** records in both PDBs (target: 2396 modules / 47,792 procs,
   0 parse errors; base likewise) even at the raw CodeView-kind level. MSVC 8.0

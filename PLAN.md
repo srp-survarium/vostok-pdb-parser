@@ -198,9 +198,10 @@ INFO`); optionally `callees` with full bodies, not just signatures.
 
 ---
 
-## DONE — Resolved decisions (2026-05-31, with the project owner)
+## Decisions (2026-05-31, with the project owner)
 
-Settled against how the loop actually works (`vostok/docs/binary_matching/`):
+Five of the six original open questions are settled below; **pragmas stay open**
+(item 4). Settled against how the loop actually works (`vostok/docs/binary_matching/`):
 
 1. **Cluster detection — none (diff-reactive).** MSVC 8.0 PDBs carry no
    inline-site records: empirically **0 `S_INLINESITE`** across both PDBs
@@ -216,9 +217,11 @@ Settled against how the loop actually works (`vostok/docs/binary_matching/`):
    (tiebreaker).** Operand/relocation-aware; the row count is only a tiebreaker
    because legitimate LTCG/linker effects (regalloc, stack-slot layout) surface as
    `~` rows. Stop when match % plateaus.
-4. **Pragmas — out of scope.** The loop does not steer inlining (`agentic_loop.md`
-   §5), so there is no pragma-dependency state to track. (Inline-control trade-offs
-   to be noted in `unanswered_questions.md`.)
+4. **Pragmas — UNRESOLVED (kept open).** The loop doesn't steer inlining today
+   (`agentic_loop.md` §5), so there's no dependency state to track yet; revisit if
+   inline-control is ever used. The near-term lever it points at — letting the agent
+   fetch the asm of a function it suspects is inlined — is logged in the loop's
+   `unanswered_questions.md`.
 5. **Selection policy — smallest-first, then topological (leaf-first).** Soft
    ordering; each function is a human-reviewed PR. Prefer target-asm size.
 6. **Cache key — deferred.** The loop does a full ~1-min rebuild; no source→asm
