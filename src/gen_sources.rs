@@ -832,6 +832,19 @@ impl<'a> Function<'a> {
                 Some(loc) => writeln!(w, "\t// FUNCTION BODY[{offset}]: {loc}")?,
             }
 
+            // Body-less function (empty `{}`): the only statements are the frame
+            // braces (open `{` + close `}`), with no body statement between them.
+            // With <= 2 statements there is no room for a real body statement, so
+            // we render an empty FUNCTION BODY — header only, no `{`/`}`/rows.
+            // This matches the target carcass (a single decl-line skeleton) and
+            // removes the confusing base-2-vs-target-1 statement mismatch.
+            if statements.len() <= 2 {
+                writeln!(w, "\t// ******")?;
+                writeln!(w, "}}")?;
+                writeln!(w)?;
+                return Ok(());
+            }
+
             let rva_diff = |lhs: pdb::Rva, rhs: pdb::Rva| -> i32 { lhs.0 as i32 - rhs.0 as i32 };
             let print_rva_diff_start = |diff: i32| match diff >= 0 {
                 true => format!("0x{diff:03x}"),
