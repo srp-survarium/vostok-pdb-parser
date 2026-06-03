@@ -65,8 +65,8 @@ pub fn render_structure(f: &FunctionEntry) -> String {
     let mut out = String::new();
 
     // Body-less functions (empty `{}`) carry only the synthetic frame braces,
-    // which the two PDBs encode as a different statement count (base 2 vs target
-    // 1). Normalize both to an empty body: header line only, zero statement rows.
+    // which the two PDBs encode with a varying statement count (1 or 2). Normalize
+    // every form to an empty body: header line only, zero statement rows.
     if f.is_body_less() {
         let _ = writeln!(out, "{}: ; 0 statements, 0x{:x} bytes", f.name, f.size);
         return out;
