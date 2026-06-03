@@ -123,21 +123,24 @@ impl FunctionEntry {
     /// override. Its only statements are the synthetic frame braces, so it
     /// carries no real body statement.
     ///
-    /// The two PDBs encode this differently, so we accept either form:
-    ///   * **base** (real sources): exactly two statements whose source texts are
-    ///     the opening `{` and closing `}` brace lines, nothing between.
-    ///   * **target** (no sources): a single statement — the decl-line skeleton
-    ///     spanning the whole function.
+    /// The first and last statements are always the synthetic frame braces (the
+    /// `{` init region and the closing `}`); a real body statement sits *strictly*
+    /// between them. So the function is body-less iff it has no statement between
+    /// those two, i.e. `statements.len() <= 2`. This is the same skip-first-last
+    /// rule `gen_sources.rs` uses (it emits body rows only for `0 < i < len-1`),
+    /// and it spans every encoding both PDBs produce:
+    ///   * **target** (no sources): the frame may collapse to a *single* statement
+    ///     (`len == 1`), or appear as two statements on separate source lines —
+    ///     init region + closing brace (`len == 2`), with no body between.
+    ///   * **base** (real sources): two statements whose source texts are the
+    ///     opening `{` and closing `}` brace lines (`len == 2`).
     ///
-    /// Both render as an empty FUNCTION BODY (header only), which removes the
-    /// confusing "1 vs 2 statements" mismatch for trivially-matching bodies.
-    /// Any function with a real body statement is *not* body-less.
+    /// All render as an empty FUNCTION BODY (header only), which removes the
+    /// confusing "0 vs 1/2 statements" mismatch for trivially-matching bodies. A
+    /// real one-line body is recorded as >= 3 statements (`{`, the body, `}`), so
+    /// no genuine body content is ever blanked.
     pub fn is_body_less(&self) -> bool {
-        match self.statements.as_slice() {
-            [_] => true,
-            [a, b] => a.source.as_deref() == Some("{") && b.source.as_deref() == Some("}"),
-            _ => false,
-        }
+        self.statements.len() <= 2
     }
 }
 
