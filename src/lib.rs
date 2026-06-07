@@ -14,6 +14,7 @@ pub mod rich_diff;
 pub mod rich_objdiff;
 pub mod rich_query;
 pub mod rich_render;
+pub mod rich_structure_diff;
 
 pub mod formatter;
 pub mod helpers;

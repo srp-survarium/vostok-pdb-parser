@@ -18,8 +18,13 @@
 //!   pdb_fetch --target-index out/target/index.jsonl \
 //!     --rva 0x573750 --view structure
 //!
-//! `--view` takes a comma list: target,base,structure,diff (default chosen from
-//! which indexes are supplied).
+//!   # base vs target *structure* diff (aligned statement skeletons)
+//!   pdb_fetch --target-index out/target/index.jsonl \
+//!     --base-index out/base/index.jsonl \
+//!     --function contact_test --view structure-diff
+//!
+//! `--view` takes a comma list: target,base,structure,diff,structure-diff
+//! (default chosen from which indexes are supplied).
 
 use std::path::Path;
 use std::path::PathBuf;
@@ -32,6 +37,7 @@ use vostok_pdb_parser::rich_diff;
 use vostok_pdb_parser::rich_objdiff;
 use vostok_pdb_parser::rich_query::{search, Query};
 use vostok_pdb_parser::rich_render::{render_info, render_listing, render_structure};
+use vostok_pdb_parser::rich_structure_diff::render_structure_diff;
 
 #[derive(Parser)]
 struct Cli {
@@ -51,8 +57,9 @@ struct Cli {
     #[arg(long, value_parser = parse_hex)]
     rva: Option<u32>,
 
-    /// Comma-separated views: target, base, structure, diff. Default depends on
-    /// which indexes are supplied (diff if both, else the available side).
+    /// Comma-separated views: target, base, structure, diff, structure-diff.
+    /// Default depends on which indexes are supplied (diff if both, else the
+    /// available side).
     #[arg(long, value_delimiter = ',')]
     view: Vec<String>,
 
@@ -182,7 +189,15 @@ fn main() {
                 (Some(b), Some(t)) => print_diff(&cli, b, t),
                 _ => eprintln!("(--view diff needs both --base-index and --target-index)"),
             },
-            other => eprintln!("(unknown view '{other}'; use target|base|structure|diff)"),
+            "structure-diff" => match (&base, &target) {
+                (Some(b), Some(t)) => print!("{}", render_structure_diff(b, t)),
+                _ => {
+                    eprintln!("(--view structure-diff needs both --base-index and --target-index)")
+                }
+            },
+            other => {
+                eprintln!("(unknown view '{other}'; use target|base|structure|diff|structure-diff)")
+            }
         }
     }
 }
