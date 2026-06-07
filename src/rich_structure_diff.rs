@@ -452,6 +452,9 @@ pub fn render_structure_diff(
 fn compact_cell(r: Option<&Row>) -> String {
     match r {
         Some(Row::Stmt { off, size, .. }) => format!("0x{off:03x} <0x{size:x}>"),
+        // An Empty (collapsed source-line gap) has no offset; show the `<0>` marker
+        // on the side that HAS it so a one-sided empty run is visible, not `--`.
+        Some(Row::Empty) => format!("{:<11}", "<0>"),
         _ => format!("{:<11}", "--"),
     }
 }
@@ -554,7 +557,7 @@ fn render_condensed(base: &FunctionEntry, target: &FunctionEntry) -> String {
                     out,
                     "{} | {} |    EMPTY only base",
                     compact_cell(None),
-                    compact_cell(None),
+                    compact_cell(Some(&Row::Empty)),
                 );
             }
             StructRow::EmptyOnlyTarget => {
@@ -563,7 +566,7 @@ fn render_condensed(base: &FunctionEntry, target: &FunctionEntry) -> String {
                 let _ = writeln!(
                     out,
                     "{} | {} |    EMPTY only target",
-                    compact_cell(None),
+                    compact_cell(Some(&Row::Empty)),
                     compact_cell(None),
                 );
             }
