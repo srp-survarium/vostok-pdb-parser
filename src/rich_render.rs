@@ -46,6 +46,49 @@ pub fn render_listing(f: &FunctionEntry) -> String {
     out
 }
 
+/// Just ONE body statement's disassembly - the instructions in `[off, off+size)`
+/// of the `n`-th body statement (1-based, matching the `--view structure` rows).
+/// Lets an agent compare a single diverging statement target-vs-base without
+/// pulling the whole function into context. A header `;` line names the statement
+/// (VA, index, size, line, source); instruction offsets stay function-relative so
+/// they line up with the full listing / structure view.
+pub fn render_listing_statement(f: &FunctionEntry, n: usize) -> String {
+    let mut out = String::new();
+    // Body statements are `statements[1..len-1]` (index 0 / len-1 are the synthetic
+    // frame braces), so the n-th body statement is `statements[n]`.
+    let last_body = f.statements.len().saturating_sub(2);
+    if n < 1 || n > last_body {
+        let _ = writeln!(out, "{}: no body statement #{} ({} body statements)", f.name, n, last_body);
+        return out;
+    }
+    let stmt = &f.statements[n];
+    let (lo, hi) = (stmt.off, stmt.off + stmt.size);
+    let va = f.image_base.wrapping_add(f.rva).wrapping_add(lo);
+    let _ = writeln!(out, "; 0x{:x} stmt #{} <0x{:x}> line {}", va, n, stmt.size, stmt.line);
+    let _ = writeln!(out, "{}", f.name);
+    for insn in f.instructions.iter().filter(|i| i.off >= lo && i.off < hi) {
+        if let Some(label) = &insn.label {
+            let _ = writeln!(out, "{label}:");
+        }
+        let _ = write!(out, "0x{:02x}:    {}", insn.off, insn.text);
+        // Carry the statement annotation (size + matched source) on the anchor
+        // instruction, exactly like the full listing - so the matched line stays
+        // in the output even when sliced to one statement.
+        if insn.off == lo {
+            match &stmt.source {
+                Some(src) => {
+                    let _ = write!(out, "\t; <0x{:x}> ; {src}", stmt.size);
+                }
+                None => {
+                    let _ = write!(out, "\t; <0x{:x}>", stmt.size);
+                }
+            }
+        }
+        let _ = writeln!(out);
+    }
+    out
+}
+
 /// Function info: the PDB-recorded locals (`type  name`). Approximate under LTO
 /// — some are optimized out and register locals may overlap arguments.
 pub fn render_info(f: &FunctionEntry) -> String {
