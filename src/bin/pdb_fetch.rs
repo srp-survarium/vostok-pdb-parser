@@ -36,7 +36,9 @@ use vostok_pdb_parser::rich_context::FunctionEntry;
 use vostok_pdb_parser::rich_diff;
 use vostok_pdb_parser::rich_objdiff;
 use vostok_pdb_parser::rich_query::{search, Query};
-use vostok_pdb_parser::rich_render::{render_info, render_listing, render_structure};
+use vostok_pdb_parser::rich_render::{
+    render_info, render_listing, render_listing_statement, render_structure,
+};
 use vostok_pdb_parser::rich_structure_diff::render_structure_diff;
 
 #[derive(Parser)]
@@ -56,6 +58,15 @@ struct Cli {
     /// Exact function RVA (hex, e.g. 0x573750).
     #[arg(long, value_parser = parse_hex)]
     rva: Option<u32>,
+
+    /// With `--view target`/`base`: show ONLY one body statement's disassembly
+    /// instead of the whole function - for comparing one diverging statement
+    /// target-vs-base. Accepts a 1-based index (`2`, matching the `--view
+    /// structure` rows) OR a hex offset/VA (`0x23` from the `offst` column, or the
+    /// absolute `0x...` from the `address` column) which selects the statement
+    /// whose byte range contains it.
+    #[arg(long)]
+    statement: Option<String>,
 
     /// Comma-separated views: target, base, structure, diff, structure-diff.
     /// Default depends on which indexes are supplied (diff if both, else the
@@ -85,6 +96,27 @@ fn parse_hex(s: &str) -> Result<u32, std::num::ParseIntError> {
         .or_else(|| s.strip_prefix("0X"))
         .unwrap_or(s);
     u32::from_str_radix(s, 16)
+}
+
+/// Resolve a `--statement` selector against `f` to a 1-based body-statement index.
+/// Decimal -> the index as-is. Hex (`0x..`) -> a function offset, or an absolute VA
+/// when the value is >= the function VA; the body statement whose `[off, off+size)`
+/// range contains it is returned (0 when none does - render_listing_statement then
+/// reports it as out of range).
+fn resolve_statement(f: &FunctionEntry, sel: &str) -> usize {
+    match sel.strip_prefix("0x").or_else(|| sel.strip_prefix("0X")) {
+        None => sel.parse::<usize>().unwrap_or(0),
+        Some(hex) => {
+            let Ok(v) = u32::from_str_radix(hex, 16) else {
+                return 0;
+            };
+            let func_va = f.image_base.wrapping_add(f.rva);
+            let off = if v >= func_va { v - func_va } else { v };
+            (1..f.statements.len().saturating_sub(1))
+                .find(|&i| off >= f.statements[i].off && off < f.statements[i].off + f.statements[i].size)
+                .unwrap_or(0)
+        }
+    }
 }
 
 /// First entry matching the selector in `index`, if any.
@@ -219,11 +251,17 @@ fn main() {
     for view in &views {
         match view.as_str() {
             "target" => match &target {
-                Some(t) => print!("{}", render_listing(t)),
+                Some(t) => match &cli.statement {
+                    Some(sel) => print!("{}", render_listing_statement(t, resolve_statement(t, sel))),
+                    None => print!("{}", render_listing(t)),
+                },
                 None => eprintln!("(no target match for --view target)"),
             },
             "base" => match &base {
-                Some(b) => print!("{}", render_listing(b)),
+                Some(b) => match &cli.statement {
+                    Some(sel) => print!("{}", render_listing_statement(b, resolve_statement(b, sel))),
+                    None => print!("{}", render_listing(b)),
+                },
                 None => eprintln!("(no base match for --view base)"),
             },
             "structure" => match target.as_ref().or(base.as_ref()) {
