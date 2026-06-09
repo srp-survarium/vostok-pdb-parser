@@ -21,6 +21,10 @@ pub struct Query<'a> {
     /// the same function, so it is the precise base↔target join key — unlike the
     /// demangled `name`, which can differ (e.g. `const` on by-value params).
     pub mangled: Option<&'a str>,
+    /// Absolute VA that must fall within the function's `[va, va+size)` range
+    /// (`va = image_base + rva`). Selects the function that CONTAINS an address —
+    /// so a raw address picks its function without a name/rva.
+    pub containing_va: Option<u32>,
 }
 
 /// Stream `index.jsonl`, returning entries that match `query`, sorted by
@@ -44,6 +48,12 @@ pub fn search(index_path: &Path, query: &Query) -> crate::Result<Vec<FunctionEnt
         }
         if query.mangled.is_some_and(|m| entry.mangled != m) {
             continue;
+        }
+        if let Some(va) = query.containing_va {
+            let base = entry.image_base.wrapping_add(entry.rva);
+            if va < base || va >= base.wrapping_add(entry.size) {
+                continue;
+            }
         }
         if let Some(needle) = &needle {
             if !entry.name.to_lowercase().contains(needle) {
