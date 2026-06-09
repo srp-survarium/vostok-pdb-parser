@@ -75,6 +75,14 @@ pub struct Instruction {
 pub struct Local {
     pub name: String,
     pub ty: String,
+    /// Lexical-scope depth the local is declared in (0 = function body; >0 = inside
+    /// nested `{}` blocks). Mirrors the carcass `name<N>` scope marker.
+    #[serde(default, skip_serializing_if = "is_zero_usize")]
+    pub scope: usize,
+}
+
+fn is_zero_usize(v: &usize) -> bool {
+    *v == 0
 }
 
 /// One source-level statement (a line-program boundary) and the byte span it
@@ -87,9 +95,17 @@ pub struct Statement {
     pub size: u32,
     /// Source line number (0 = unknown).
     pub line: u32,
+    /// Lexical-scope depth where a `{}` block *opens* at this statement (0 = none).
+    /// Mirrors the carcass `[N]` marker; only the block-opening statement carries it.
+    #[serde(default, skip_serializing_if = "is_zero_i32")]
+    pub depth: i32,
     /// Real source text (base only; `None` for target / inlined-headerless code).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source: Option<String>,
+}
+
+fn is_zero_i32(v: &i32) -> bool {
+    *v == 0
 }
 
 /// One function's full structured record, serialized one-per-line into
@@ -119,6 +135,11 @@ pub struct FunctionEntry {
     /// PDB-recorded local variables (approximate under LTO).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub locals: Vec<Local>,
+    /// `{}` blocks that open at an RVA with no line-program statement (so they
+    /// can't be marked on a statement row). `(off, depth)`, mirrors the carcass
+    /// "SKIPPED BLOCKS" section.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub skipped_blocks: Vec<(u32, i32)>,
 }
 
 impl FunctionEntry {
@@ -211,6 +232,10 @@ pub fn dump_rich_context(pdb_path: &Path, exe_path: &Path, opts: &Options) -> cr
             // (which follow the Procedure symbol) attach to the right entry.
             let mut current_entry: Option<usize> = None;
             let mut current_end = pdb::SymbolIndex(0);
+            // Lexical-scope depth: 1 inside a procedure body, +1 per nested `{}`
+            // block, back down on each scope-end. Used to mark block-opening
+            // statements and to scope locals (mirrors gen_sources).
+            let mut depth: i32 = 0;
 
             while let Some(sym) = syms.next()? {
                 // Once we pass the current procedure's end symbol, its scope (and
@@ -223,6 +248,7 @@ pub fn dump_rich_context(pdb_path: &Path, exe_path: &Path, opts: &Options) -> cr
                     Ok(pdb::SymbolData::Procedure(proc)) => {
                         current_entry = None;
                         current_end = proc.end;
+                        depth = 1; // a procedure opens the body scope
 
                         // Build the entry; `break 'build None` skips (non-.text,
                         // no line info, non-engine in tree mode, …) without losing
@@ -309,13 +335,30 @@ pub fn dump_rich_context(pdb_path: &Path, exe_path: &Path, opts: &Options) -> cr
                     // through under optimization. Args (offset >= 0) are skipped —
                     // they are already in the signature.
                     Ok(pdb::SymbolData::BasePointerRelative(b)) if b.offset < 0 => {
-                        push_local(&mut entries, current_entry, &fmt, module_id, b.type_index, b.name);
+                        push_local(&mut entries, current_entry, &fmt, module_id, b.type_index, b.name, depth);
                     }
                     Ok(pdb::SymbolData::RegisterRelative(r)) => {
-                        push_local(&mut entries, current_entry, &fmt, module_id, r.type_index, r.name);
+                        push_local(&mut entries, current_entry, &fmt, module_id, r.type_index, r.name, depth);
                     }
                     Ok(pdb::SymbolData::RegisterVariable(v)) => {
-                        push_local(&mut entries, current_entry, &fmt, module_id, v.type_index, v.name);
+                        push_local(&mut entries, current_entry, &fmt, module_id, v.type_index, v.name, depth);
+                    }
+
+                    // A `{}` block opening at depth N: mark its opening statement
+                    // (the one at the block's RVA) and descend. Blocks with no
+                    // matching statement are dropped (no-address rows aren't shown).
+                    Ok(pdb::SymbolData::Block(blk)) if depth >= 1 => {
+                        if let (Some(ci), Some(rva)) = (current_entry, blk.offset.to_rva(&address_map)) {
+                            let off = rva.0.wrapping_sub(entries[ci].rva);
+                            match entries[ci].statements.iter_mut().find(|s| s.off == off) {
+                                Some(st) => st.depth = depth,
+                                None => entries[ci].skipped_blocks.push((off, depth)),
+                            }
+                        }
+                        depth += 1;
+                    }
+                    Ok(pdb::SymbolData::ScopeEnd) => {
+                        depth = (depth - 1).max(0);
                     }
                     _ => {}
                 }
@@ -404,6 +447,7 @@ fn build_function(
                 off: start_off,
                 size: end_off.saturating_sub(start_off),
                 line,
+                depth: 0,
                 source,
             }
         })
@@ -419,6 +463,7 @@ fn build_function(
         statements,
         instructions,
         locals: Vec::new(),
+        skipped_blocks: Vec::new(),
     }
 }
 
@@ -431,6 +476,7 @@ fn push_local(
     module_id: usize,
     type_index: pdb::TypeIndex,
     name: pdb::RawString<'_>,
+    depth: i32,
 ) {
     let Some(ci) = current else {
         return;
@@ -442,6 +488,8 @@ fn push_local(
     entries[ci].locals.push(Local {
         name: name.to_string().into_owned(),
         ty,
+        // Function-body locals are depth 1 -> scope 0; each nested block adds one.
+        scope: (depth - 1).max(0) as usize,
     });
 }
 

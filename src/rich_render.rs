@@ -90,6 +90,7 @@ pub fn render_structure(f: &FunctionEntry) -> String {
         va: u32,
         off: u32,
         delta: i64,
+        depth: i32,
         line: u32,
         src: Option<String>,
     }
@@ -100,6 +101,7 @@ pub fn render_structure(f: &FunctionEntry) -> String {
                 va: f.image_base.wrapping_add(f.rva).wrapping_add(s.off),
                 off: s.off,
                 delta: f.statements[i + 1].off as i64 - s.off as i64,
+                depth: s.depth,
                 line: s.line,
                 src: s.source.clone(),
             }
@@ -120,8 +122,30 @@ pub fn render_structure(f: &FunctionEntry) -> String {
     let (wa, wo, ws) = (2 + da, 2 + dofs, 3 + dd);
     let wl = rows.iter().map(|r| format!("{}", r.line).len()).max().unwrap_or(0).max("line".len());
 
-    let _ = writeln!(out, "{:<wa$}|{:<wo$}|{:^ws$}|{:<wl$}", "address", "offst", "size", "line");
-    let _ = writeln!(out, "{}+{}+{}+{}", "-".repeat(wa), "-".repeat(wo), "-".repeat(ws), "-".repeat(wl));
+    // `{}` blocks that open at a no-statement RVA can't be marked on a row; list
+    // them on their own (VA + offset aligned to the table below), like the carcass
+    // "SKIPPED BLOCKS" section. The local's `scope: N` still flags they exist.
+    if !f.skipped_blocks.is_empty() {
+        let _ = writeln!(out, "; skipped blocks ({}):", f.skipped_blocks.len());
+        for &(off, depth) in &f.skipped_blocks {
+            let va = f.image_base.wrapping_add(f.rva).wrapping_add(off);
+            let _ = writeln!(out, ";   0x{:0da$x}|0x{:0dofs$x}  scope: {}", va, off, depth);
+        }
+    }
+
+    // The `scope` column (carcass `[N]`: a `{}` block opens at this statement) only
+    // appears when some block actually opens, so simple bodies stay 4 columns wide.
+    let scope_cell = |d: i32| if d > 0 { format!("[{}]", d) } else { String::new() };
+    let has_scope = rows.iter().any(|r| r.depth > 0);
+    let wsc = rows.iter().map(|r| scope_cell(r.depth).len()).max().unwrap_or(0).max("scope".len());
+
+    if has_scope {
+        let _ = writeln!(out, "{:<wa$}|{:<wo$}|{:^ws$}|{:^wsc$}|{:<wl$}", "address", "offst", "size", "scope", "line");
+        let _ = writeln!(out, "{}+{}+{}+{}+{}", "-".repeat(wa), "-".repeat(wo), "-".repeat(ws), "-".repeat(wsc), "-".repeat(wl));
+    } else {
+        let _ = writeln!(out, "{:<wa$}|{:<wo$}|{:^ws$}|{:<wl$}", "address", "offst", "size", "line");
+        let _ = writeln!(out, "{}+{}+{}+{}", "-".repeat(wa), "-".repeat(wo), "-".repeat(ws), "-".repeat(wl));
+    }
     for r in &rows {
         let sign = if r.delta < 0 { "-" } else { "+" };
         let _ = write!(
@@ -131,6 +155,9 @@ pub fn render_structure(f: &FunctionEntry) -> String {
             r.off,
             r.delta.unsigned_abs(),
         );
+        if has_scope {
+            let _ = write!(out, "{:<wsc$}|", scope_cell(r.depth));
+        }
         // Pad `line` only when source text trails it (base), so target rows carry no
         // trailing whitespace.
         match &r.src {
@@ -153,7 +180,15 @@ fn render_locals_into(out: &mut String, f: &FunctionEntry) {
         return;
     }
     let _ = writeln!(out, "; locals ({}):", f.locals.len());
+    // Align the type and name columns; spell out the scope depth (a local declared
+    // inside nested `{}` blocks) so it doesn't read like the type's template brackets.
+    let wt = f.locals.iter().map(|l| l.ty.len()).max().unwrap_or(0);
+    let wn = f.locals.iter().map(|l| l.name.len()).max().unwrap_or(0);
     for l in &f.locals {
-        let _ = writeln!(out, ";   {}\t{}", l.ty, l.name);
+        let mut line = format!(";   {:<wt$}  {:<wn$}", l.ty, l.name);
+        if l.scope > 0 {
+            line += &format!("  scope: {}", l.scope);
+        }
+        let _ = writeln!(out, "{}", line.trim_end());
     }
 }
