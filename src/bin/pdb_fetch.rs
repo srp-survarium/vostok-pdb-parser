@@ -194,14 +194,22 @@ fn main() {
         eprintln!("error: supply --target-index and/or --base-index");
         std::process::exit(2);
     }
-    if cli.function.is_none() && cli.rva.is_none() {
-        eprintln!("error: select a function with --function or --rva");
+    if cli.function.is_none() && cli.rva.is_none() && cli.address.is_none() {
+        eprintln!("error: select a function with --function, --rva, or --address");
         std::process::exit(2);
     }
 
+    // An absolute --address also SELECTS the function it falls in (no need for
+    // --function). --offset is function-relative, so it can't select on its own.
+    let containing = if cli.function.is_none() && cli.rva.is_none() {
+        cli.address
+    } else {
+        None
+    };
     let query = Query {
         name: cli.function.as_deref(),
         rva: cli.rva,
+        containing_va: containing,
         ..Default::default()
     };
 
@@ -227,6 +235,7 @@ fn main() {
                 let q = Query {
                     name: cli.function.as_deref(),
                     rva: cli.rva,
+                    containing_va: containing,
                     ..Default::default()
                 };
                 match first_match(p, &q) {
