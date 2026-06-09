@@ -312,20 +312,15 @@ fn one_side<'a>(r: &'a Row<'a>, side: Side) -> StructRow<'a> {
 /// match the `target:` / `base:` header order); each divergence carries a
 /// trailing tag. When `condensed`, collapse aligned-equal runs to `.. same ..`
 /// and emit only the divergence rows in a compact one-line form.
-pub fn render_structure_diff(
-    base: &FunctionEntry,
-    target: &FunctionEntry,
-    condensed: bool,
-) -> String {
+pub fn render_structure_diff(base: &FunctionEntry, target: &FunctionEntry) -> String {
     let base_rows = structure_rows(base);
     let target_rows = structure_rows(target);
     let rows = diff_structure(&base_rows, &target_rows);
     let va = |f: &FunctionEntry, off: u32| f.image_base.wrapping_add(f.rva).wrapping_add(off);
 
-    // One display row per REAL statement; `Empty` (blank-line gap) rows are noise
-    // and dropped. `addr` is the divergent/present side's VA (for `--address`).
+    // One row per DIVERGING statement; equal statements and `Empty` blank-line gaps
+    // are dropped (the table IS the divergence list, tagged by `b.diff`).
     struct D {
-        n: usize,
         taddr: Option<u32>,
         baddr: Option<u32>,
         tsize: Option<u32>,
@@ -343,59 +338,39 @@ pub fn render_structure_diff(
     };
 
     let mut ds: Vec<D> = Vec::new();
-    let mut summary: Vec<String> = Vec::new();
-    let (mut size_diffs, mut quantity_diffs) = (0usize, 0usize);
-    let mut n = 0;
     for r in &rows {
         match r {
-            // Both sides present: anchor on the editable BASE side (addr/line/code);
-            // the target only contributes its size (the goal to match toward).
-            StructRow::Equal { base: b, target: t } => {
-                n += 1;
-                if let (Row::Stmt { off: toff, size: ts, .. }, Row::Stmt { off: boff, size: bs, line, .. }) = (t, b) {
-                    ds.push(D { n, taddr: Some(va(target, *toff)), baddr: Some(va(base, *boff)), tsize: Some(*ts), bsize: Some(*bs), line: *line, code: code_of(b, *line), tag: String::new() });
-                }
-            }
+            // Equal statements and blank-line gaps are not divergences - skip.
+            StructRow::Equal { .. }
+            | StructRow::EmptyEqual
+            | StructRow::EmptyOnlyTarget
+            | StructRow::EmptyOnlyBase => {}
+            // SIZE: same statement, different byte size. Anchor on the editable BASE
+            // side (line/code); the target contributes its size (the goal).
             StructRow::Changed { base: b, target: t } => {
-                n += 1;
-                size_diffs += 1;
                 if let (Row::Stmt { off: toff, size: ts, .. }, Row::Stmt { off: boff, size: bs, line, .. }) = (t, b) {
                     let delta = signed_hex(*bs as i64 - *ts as i64);
-                    summary.push(format!("#{n} b.L{line} SIZE {delta} (t 0x{ts:x}/b 0x{bs:x})"));
-                    ds.push(D { n, taddr: Some(va(target, *toff)), baddr: Some(va(base, *boff)), tsize: Some(*ts), bsize: Some(*bs), line: *line, code: code_of(b, *line), tag: format!("SIZE {delta}") });
+                    ds.push(D { taddr: Some(va(target, *toff)), baddr: Some(va(base, *boff)), tsize: Some(*ts), bsize: Some(*bs), line: *line, code: code_of(b, *line), tag: format!("SIZE {delta}") });
                 }
             }
-            // Quantity divergences: only one side has the statement.
+            // Quantity: a statement present on one side only.
             StructRow::OnlyTarget { stmt } => {
-                n += 1;
-                quantity_diffs += 1;
                 if let Row::Stmt { off, size, line, .. } = stmt {
-                    summary.push(format!("#{n} t.L{line} T_ONLY"));
-                    ds.push(D { n, taddr: Some(va(target, *off)), baddr: None, tsize: Some(*size), bsize: None, line: *line, code: code_of(stmt, *line), tag: "T_ONLY".to_string() });
+                    ds.push(D { taddr: Some(va(target, *off)), baddr: None, tsize: Some(*size), bsize: None, line: *line, code: code_of(stmt, *line), tag: "TRGT_ONLY".to_string() });
                 }
             }
             StructRow::OnlyBase { stmt } => {
-                n += 1;
-                quantity_diffs += 1;
                 if let Row::Stmt { off, size, line, .. } = stmt {
-                    summary.push(format!("#{n} b.L{line} B_ONLY"));
-                    ds.push(D { n, taddr: None, baddr: Some(va(base, *off)), tsize: None, bsize: Some(*size), line: *line, code: code_of(stmt, *line), tag: "B_ONLY".to_string() });
+                    ds.push(D { taddr: None, baddr: Some(va(base, *off)), tsize: None, bsize: Some(*size), line: *line, code: code_of(stmt, *line), tag: "BASE_ONLY".to_string() });
                 }
             }
-            // Blank-line-gap rows carry no structural signal - drop them.
-            StructRow::EmptyEqual | StructRow::EmptyOnlyTarget | StructRow::EmptyOnlyBase => {}
         }
     }
 
     let mut out = String::new();
-    // FIRST comment: what is different (the agent reads this and knows).
-    if size_diffs == 0 && quantity_diffs == 0 {
+    // A clean match has no diverging rows - say so explicitly (the table would be empty).
+    if ds.is_empty() {
         let _ = writeln!(out, "; STRUCTURE MATCH");
-    } else {
-        let _ = writeln!(out, "; DIFF: size-diffs {size_diffs}, quantity-diffs {quantity_diffs}");
-        for s in &summary {
-            let _ = writeln!(out, ";   {s}");
-        }
     }
     // Then per-side stats, signature, and a braced body - same shape as the
     // single-side `--view structure`.
@@ -406,38 +381,29 @@ pub fn render_structure_diff(
     let _ = writeln!(out, "{}", base.name);
     let _ = writeln!(out, "{{");
 
-    // Table: editable base side (b.addr/b.line/b.code) + the target size to match
-    // (t.sz). Data-driven, zero-padded hex widths like `--view structure`.
-    let sz = |o: Option<u32>| o.map(|v| format!("0x{v:x}")).unwrap_or_else(|| "--".into());
-    // Both address columns zero-padded to a common hex width; absent side -> `--`.
-    let ah = ds.iter().flat_map(|d| [d.taddr, d.baddr]).flatten().map(|a| format!("{:x}", a).len()).max().unwrap_or(1);
-    let addr = |o: Option<u32>| o.map(|a| format!("0x{:0ah$x}", a, ah = ah)).unwrap_or_else(|| "--".into());
-    let wd = ds.iter().map(|d| d.tag.len()).max().unwrap_or(0).max("b.diff".len());
-    let wta = ds.iter().map(|d| addr(d.taddr).len()).max().unwrap_or(0).max("t.addr".len());
-    let wba = ds.iter().map(|d| addr(d.baddr).len()).max().unwrap_or(0).max("b.addr".len());
-    let wt = ds.iter().map(|d| sz(d.tsize).len()).max().unwrap_or(0).max("t.sz".len());
-    let wb = ds.iter().map(|d| sz(d.bsize).len()).max().unwrap_or(0).max("b.sz".len());
-    let wl = ds.iter().map(|d| d.line.to_string().len()).max().unwrap_or(0).max("b.line".len());
-    // In condensed view a clean match has no rows to show - skip the empty table.
-    let has_div = ds.iter().any(|d| !d.tag.is_empty());
-    if !condensed || has_div {
+    if !ds.is_empty() {
+        // One row per diverging statement: base-anchored line/code + both VAs (so the
+        // agent can `--address` either side) + both sizes. Data-driven hex widths.
+        let sz = |o: Option<u32>| o.map(|v| format!("0x{v:x}")).unwrap_or_else(|| "--".into());
+        let ah = ds.iter().flat_map(|d| [d.taddr, d.baddr]).flatten().map(|a| format!("{:x}", a).len()).max().unwrap_or(1);
+        let addr = |o: Option<u32>| o.map(|a| format!("0x{:0ah$x}", a, ah = ah)).unwrap_or_else(|| "--".into());
+        let wd = ds.iter().map(|d| d.tag.len()).max().unwrap_or(0).max("b.diff".len());
+        let wta = ds.iter().map(|d| addr(d.taddr).len()).max().unwrap_or(0).max("t.addr".len());
+        let wba = ds.iter().map(|d| addr(d.baddr).len()).max().unwrap_or(0).max("b.addr".len());
+        let wt = ds.iter().map(|d| sz(d.tsize).len()).max().unwrap_or(0).max("t.sz".len());
+        let wb = ds.iter().map(|d| sz(d.bsize).len()).max().unwrap_or(0).max("b.sz".len());
+        let wl = ds.iter().map(|d| d.line.to_string().len()).max().unwrap_or(0).max("b.line".len());
         let _ = writeln!(out, "{:<wd$}|{:<wta$}|{:<wba$}|{:<wt$}|{:<wb$}|{:<wl$}|b.code", "b.diff", "t.addr", "b.addr", "t.sz", "b.sz", "b.line");
         let _ = writeln!(out, "{}+{}+{}+{}+{}+{}+------", "-".repeat(wd), "-".repeat(wta), "-".repeat(wba), "-".repeat(wt), "-".repeat(wb), "-".repeat(wl));
-    }
-    for d in &ds {
-        // Condensed: show only the divergences (drop the matching rows); the summary
-        // already gives the overview.
-        if condensed && d.tag.is_empty() {
-            continue;
+        for d in &ds {
+            // A TRGT_ONLY row has no base statement - base line/code are `--`.
+            let (bline, bcode): (String, &str) = if d.baddr.is_some() {
+                (d.line.to_string(), d.code.as_str())
+            } else {
+                ("--".to_string(), "--")
+            };
+            let _ = writeln!(out, "{:<wd$}|{:<wta$}|{:<wba$}|{:<wt$}|{:<wb$}|{:<wl$}|{}", d.tag, addr(d.taddr), addr(d.baddr), sz(d.tsize), sz(d.bsize), bline, bcode);
         }
-        // b.line / b.code belong to the base side; when base has no statement here
-        // (a T_ONLY row) they are `--`, not the target's line (which is in the summary).
-        let (bline, bcode): (String, &str) = if d.baddr.is_some() {
-            (d.line.to_string(), d.code.as_str())
-        } else {
-            ("--".to_string(), "--")
-        };
-        let _ = writeln!(out, "{:<wd$}|{:<wta$}|{:<wba$}|{:<wt$}|{:<wb$}|{:<wl$}|{}", d.tag, addr(d.taddr), addr(d.baddr), sz(d.tsize), sz(d.bsize), bline, bcode);
     }
     let _ = writeln!(out, "}}");
     out

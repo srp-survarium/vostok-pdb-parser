@@ -83,12 +83,6 @@ struct Cli {
     #[arg(long, value_delimiter = ',')]
     view: Vec<String>,
 
-    /// Only meaningful with `--view structure-diff`: collapse maximal runs of
-    /// aligned-equal rows to a single `.. same ..` line and show only the
-    /// divergences (size + quantity diffs).
-    #[arg(long)]
-    condensed: bool,
-
     /// Delinker base `.obj` dir (e.g. binaries/objdiff/base). With its target
     /// counterpart, `--view diff` uses the operand-aware objdiff-core backend.
     #[arg(long, value_hint = clap::ValueHint::DirPath)]
@@ -189,6 +183,7 @@ fn resolve_by_identity(
 
 fn main() {
     let cli = Cli::parse();
+    let _log = LogGuard::start(resolve_log_path(&cli));
 
     if cli.target_index.is_none() && cli.base_index.is_none() {
         eprintln!("error: supply --target-index and/or --base-index");
@@ -310,7 +305,7 @@ fn main() {
             },
             "structure-diff" => match (&base, &target) {
                 (Some(b), Some(t)) => {
-                    print!("{}", render_structure_diff(b, t, cli.condensed))
+                    print!("{}", render_structure_diff(b, t))
                 }
                 _ => {
                     // Distinguish a genuinely absent index flag (keep the original
@@ -375,6 +370,75 @@ fn describe_selector(cli: &Cli) -> String {
         (None, Some(rva)) => format!("rva 0x{rva:x}"),
         (None, None) => "<none>".to_string(),
     }
+}
+
+/// Audit log: when `$PDB_FETCH_LOG` is set, append one tab-separated line per
+/// invocation - `<timestamp>  <elapsed>ms  <git-branch>  <all flags>` - so the
+/// agent's tool usage (which view, which function/address, from which worktree,
+/// when) is reviewable. Logs on Drop, so it fires for any normal completion.
+struct LogGuard {
+    start: std::time::Instant,
+    when: chrono::DateTime<chrono::Local>,
+    path: Option<PathBuf>,
+}
+
+impl LogGuard {
+    fn start(path: Option<PathBuf>) -> Self {
+        Self {
+            start: std::time::Instant::now(),
+            when: chrono::Local::now(),
+            path,
+        }
+    }
+}
+
+impl Drop for LogGuard {
+    fn drop(&mut self) {
+        let Some(path) = &self.path else {
+            return;
+        };
+        let args: Vec<String> = std::env::args().skip(1).collect();
+        let line = format!(
+            "{}\t{}ms\t{}\t{}\n",
+            self.when.format("%Y-%m-%d %H:%M:%S%.3f"),
+            self.start.elapsed().as_millis(),
+            current_branch(),
+            args.join(" "),
+        );
+        use std::io::Write as _;
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+            let _ = f.write_all(line.as_bytes());
+        }
+    }
+}
+
+/// Where to write the audit log: `$PDB_FETCH_LOG` if set (an override), else
+/// `<binaries>/<tool>.log` - `<binaries>` derived from the index path
+/// (`binaries/rich/<side>/index.jsonl` -> `binaries`), `<tool>` from argv[0].
+/// `None` (no logging) when neither is available.
+fn resolve_log_path(cli: &Cli) -> Option<PathBuf> {
+    if let Ok(p) = std::env::var("PDB_FETCH_LOG") {
+        return Some(PathBuf::from(p));
+    }
+    let idx = cli.target_index.as_deref().or(cli.base_index.as_deref())?;
+    let binaries = idx.ancestors().nth(3)?;
+    let tool = std::env::args()
+        .next()
+        .and_then(|a| Path::new(&a).file_name().map(|s| s.to_string_lossy().into_owned()))
+        .unwrap_or_else(|| "pdb_fetch".into());
+    Some(binaries.join(format!("{tool}.log")))
+}
+
+/// Current git branch of the working dir (for the audit log); `?` if unavailable.
+fn current_branch() -> String {
+    std::process::Command::new("git")
+        .args(["rev-parse", "--abbrev-ref", "HEAD"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "?".into())
 }
 
 fn fail(msg: &str) -> ! {
