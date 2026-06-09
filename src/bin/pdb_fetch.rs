@@ -42,6 +42,7 @@ use vostok_pdb_parser::rich_render::{
 use vostok_pdb_parser::rich_structure_diff::render_structure_diff;
 
 #[derive(Parser)]
+#[command(group(clap::ArgGroup::new("statement").args(["index", "offset", "address"]).multiple(false)))]
 struct Cli {
     /// Target index.jsonl (the original game; what we match against).
     #[arg(long, value_hint = clap::ValueHint::FilePath)]
@@ -59,14 +60,22 @@ struct Cli {
     #[arg(long, value_parser = parse_hex)]
     rva: Option<u32>,
 
-    /// With `--view target`/`base`: show ONLY one body statement's disassembly
-    /// instead of the whole function - for comparing one diverging statement
-    /// target-vs-base. Accepts a 1-based index (`2`, matching the `--view
-    /// structure` rows) OR a hex offset/VA (`0x23` from the `offst` column, or the
-    /// absolute `0x...` from the `address` column) which selects the statement
-    /// whose byte range contains it.
+    // Select ONE body statement for `--view target`/`base` (mutually exclusive) -
+    // shows just that statement's disassembly, for comparing one diverging
+    // statement target-vs-base without pulling the whole function into context.
+    /// 1-based body-statement index, matching the `--view structure` rows.
     #[arg(long)]
-    statement: Option<String>,
+    index: Option<usize>,
+
+    /// Function-relative offset (hex) - the `offst` column; the statement whose
+    /// byte range contains it is shown.
+    #[arg(long, value_parser = parse_hex)]
+    offset: Option<u32>,
+
+    /// Absolute VA (hex) - the `address` column; the statement whose byte range
+    /// contains it is shown.
+    #[arg(long, value_parser = parse_hex)]
+    address: Option<u32>,
 
     /// Comma-separated views: target, base, structure, diff, structure-diff.
     /// Default depends on which indexes are supplied (diff if both, else the
@@ -98,25 +107,21 @@ fn parse_hex(s: &str) -> Result<u32, std::num::ParseIntError> {
     u32::from_str_radix(s, 16)
 }
 
-/// Resolve a `--statement` selector against `f` to a 1-based body-statement index.
-/// Decimal -> the index as-is. Hex (`0x..`) -> a function offset, or an absolute VA
-/// when the value is >= the function VA; the body statement whose `[off, off+size)`
-/// range contains it is returned (0 when none does - render_listing_statement then
-/// reports it as out of range).
-fn resolve_statement(f: &FunctionEntry, sel: &str) -> usize {
-    match sel.strip_prefix("0x").or_else(|| sel.strip_prefix("0X")) {
-        None => sel.parse::<usize>().unwrap_or(0),
-        Some(hex) => {
-            let Ok(v) = u32::from_str_radix(hex, 16) else {
-                return 0;
-            };
-            let func_va = f.image_base.wrapping_add(f.rva);
-            let off = if v >= func_va { v - func_va } else { v };
-            (1..f.statements.len().saturating_sub(1))
-                .find(|&i| off >= f.statements[i].off && off < f.statements[i].off + f.statements[i].size)
-                .unwrap_or(0)
-        }
+/// Resolve the `--index`/`--offset`/`--address` selector against `f` to a 1-based
+/// body-statement index. Returns `None` when no selector was given (render the whole
+/// function); `Some(0)` when an offset/address matched no statement (render then
+/// reports it as out of range). The flags are mutually exclusive (clap enforces it).
+fn resolve_statement(f: &FunctionEntry, cli: &Cli) -> Option<usize> {
+    if let Some(n) = cli.index {
+        return Some(n);
     }
+    let func_va = f.image_base.wrapping_add(f.rva);
+    let off = cli.offset.or_else(|| cli.address.map(|a| a.wrapping_sub(func_va)))?;
+    Some(
+        (1..f.statements.len().saturating_sub(1))
+            .find(|&i| off >= f.statements[i].off && off < f.statements[i].off + f.statements[i].size)
+            .unwrap_or(0),
+    )
 }
 
 /// First entry matching the selector in `index`, if any.
@@ -251,15 +256,15 @@ fn main() {
     for view in &views {
         match view.as_str() {
             "target" => match &target {
-                Some(t) => match &cli.statement {
-                    Some(sel) => print!("{}", render_listing_statement(t, resolve_statement(t, sel))),
+                Some(t) => match resolve_statement(t, &cli) {
+                    Some(n) => print!("{}", render_listing_statement(t, n)),
                     None => print!("{}", render_listing(t)),
                 },
                 None => eprintln!("(no target match for --view target)"),
             },
             "base" => match &base {
-                Some(b) => match &cli.statement {
-                    Some(sel) => print!("{}", render_listing_statement(b, resolve_statement(b, sel))),
+                Some(b) => match resolve_statement(b, &cli) {
+                    Some(n) => print!("{}", render_listing_statement(b, n)),
                     None => print!("{}", render_listing(b)),
                 },
                 None => eprintln!("(no base match for --view base)"),
