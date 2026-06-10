@@ -332,9 +332,12 @@ pub fn render_structure_diff(base: &FunctionEntry, target: &FunctionEntry) -> St
     // Signed `b.sz - t.sz` (base minus target): positive = base is LARGER and must
     // shrink, negative = base is smaller and must grow.
     let signed_hex = |d: i64| if d >= 0 { format!("+0x{:x}", d) } else { format!("-0x{:x}", -d) };
-    let code_of = |r: &Row, line: u32| match r {
+    // No source text (target side, or a base stmt without captured source) renders
+    // as `--`; the statement's LINE always goes in the dedicated line column - never
+    // an `L<n>` stand-in here (it read as inconsistent output).
+    let code_of = |r: &Row, _line: u32| match r {
         Row::Stmt { source: Some(s), .. } => s.to_string(),
-        _ => format!("L{line}"),
+        _ => "--".to_string(),
     };
 
     let mut ds: Vec<D> = Vec::new();
@@ -392,17 +395,15 @@ pub fn render_structure_diff(base: &FunctionEntry, target: &FunctionEntry) -> St
         let wba = ds.iter().map(|d| addr(d.baddr).len()).max().unwrap_or(0).max("b.addr".len());
         let wt = ds.iter().map(|d| sz(d.tsize).len()).max().unwrap_or(0).max("t.sz".len());
         let wb = ds.iter().map(|d| sz(d.bsize).len()).max().unwrap_or(0).max("b.sz".len());
-        let wl = ds.iter().map(|d| d.line.to_string().len()).max().unwrap_or(0).max("b.line".len());
-        let _ = writeln!(out, "{:<wd$}|{:<wta$}|{:<wba$}|{:<wt$}|{:<wb$}|{:<wl$}|b.code", "b.diff", "t.addr", "b.addr", "t.sz", "b.sz", "b.line");
+        let wl = ds.iter().map(|d| d.line.to_string().len()).max().unwrap_or(0).max("line".len());
+        let _ = writeln!(out, "{:<wd$}|{:<wta$}|{:<wba$}|{:<wt$}|{:<wb$}|{:<wl$}|b.code", "b.diff", "t.addr", "b.addr", "t.sz", "b.sz", "line");
         let _ = writeln!(out, "{}+{}+{}+{}+{}+{}+------", "-".repeat(wd), "-".repeat(wta), "-".repeat(wba), "-".repeat(wt), "-".repeat(wb), "-".repeat(wl));
         for d in &ds {
-            // A TRGT_ONLY row has no base statement - base line/code are `--`.
-            let (bline, bcode): (String, &str) = if d.baddr.is_some() {
-                (d.line.to_string(), d.code.as_str())
-            } else {
-                ("--".to_string(), "--")
-            };
-            let _ = writeln!(out, "{:<wd$}|{:<wta$}|{:<wba$}|{:<wt$}|{:<wb$}|{:<wl$}|{}", d.tag, addr(d.taddr), addr(d.baddr), sz(d.tsize), sz(d.bsize), bline, bcode);
+            // The line column always prints the owning side's statement line - for a
+            // TRGT_ONLY row that is the TARGET line-table line (the original source
+            // line, i.e. the carcass `'NN'`); only the base CODE is `--` there.
+            let bcode: &str = if d.baddr.is_some() { d.code.as_str() } else { "--" };
+            let _ = writeln!(out, "{:<wd$}|{:<wta$}|{:<wba$}|{:<wt$}|{:<wb$}|{:<wl$}|{}", d.tag, addr(d.taddr), addr(d.baddr), sz(d.tsize), sz(d.bsize), d.line, bcode);
         }
     }
     let _ = writeln!(out, "}}");
