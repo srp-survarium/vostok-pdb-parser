@@ -76,9 +76,47 @@ impl<'a, 's> PdbParser<'a, 's> {
         module_id: usize,
         type_index: pdb::TypeIndex,
     ) -> crate::Result<String> {
+        use pdb_addr2line::pdb::TypeData;
+
         let mut type_name = String::new();
         self.formatter.for_module(module_id, |tf| {
-            tf.emit_type_index(&mut type_name, ti(type_index))
+            let index = ti(type_index);
+            // The formatter renders only the `constant` bit of LF_MODIFIER and
+            // drops `volatile`, so volatile-qualified types (e.g. the
+            // interlocked-guarded `volatile long` reference counters) are
+            // rendered here instead. const-only modifiers keep the formatter's
+            // own path so their placement rules stay untouched.
+            match tf.parse_type_index(index) {
+                Ok(TypeData::Modifier(modifier)) if modifier.volatile => {
+                    match tf.parse_type_index(modifier.underlying_type) {
+                        // LF_MODIFIER wrapping a pointer qualifies the pointer
+                        // itself: `T* volatile` / `T* const volatile`.
+                        Ok(TypeData::Pointer(pointer)) => {
+                            tf.emit_ptr(&mut type_name, pointer, modifier.constant)?;
+                            type_name.push_str(" volatile");
+                            Ok(())
+                        }
+                        Ok(underlying) => {
+                            if modifier.constant {
+                                type_name.push_str("const ");
+                            }
+                            type_name.push_str("volatile ");
+                            tf.emit_type(&mut type_name, underlying)
+                        }
+                        Err(error) => Err(error),
+                    }
+                }
+                // `T* volatile` can also be recorded directly in the pointer
+                // record's attribute bits, without an LF_MODIFIER wrapper
+                // (e.g. engine_world::m_sound_world). The formatter renders
+                // the const attribute bit but drops the volatile one.
+                Ok(TypeData::Pointer(pointer)) if pointer.attributes.is_volatile() => {
+                    tf.emit_ptr(&mut type_name, pointer, false)?;
+                    type_name.push_str(" volatile");
+                    Ok(())
+                }
+                _ => tf.emit_type_index(&mut type_name, index),
+            }
         })?;
         Ok(type_name)
     }
