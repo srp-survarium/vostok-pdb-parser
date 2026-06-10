@@ -92,8 +92,8 @@ impl<'a, 's> PdbParser<'a, 's> {
                         // LF_MODIFIER wrapping a pointer qualifies the pointer
                         // itself: `T* volatile` / `T* const volatile`.
                         Ok(TypeData::Pointer(pointer)) => {
-                            tf.emit_ptr(&mut type_name, pointer, modifier.constant)?;
-                            type_name.push_str(" volatile");
+                            // the bumped fork renders `* volatile` itself via the 4th arg
+                            tf.emit_ptr(&mut type_name, pointer, modifier.constant, true)?;
                             Ok(())
                         }
                         Ok(underlying) => {
@@ -111,8 +111,7 @@ impl<'a, 's> PdbParser<'a, 's> {
                 // (e.g. engine_world::m_sound_world). The formatter renders
                 // the const attribute bit but drops the volatile one.
                 Ok(TypeData::Pointer(pointer)) if pointer.attributes.is_volatile() => {
-                    tf.emit_ptr(&mut type_name, pointer, false)?;
-                    type_name.push_str(" volatile");
+                    tf.emit_ptr(&mut type_name, pointer, false, true)?;
                     Ok(())
                 }
                 _ => tf.emit_type_index(&mut type_name, index),
