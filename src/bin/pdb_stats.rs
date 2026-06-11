@@ -244,9 +244,8 @@ fn write_json<T: serde::Serialize>(value: &T, pretty: bool) -> anyhow::Result<()
 // Table output
 // ---------------------------------------------------------------------------
 
-const COL_WIDTH_NAME: usize = 62;
-const COL_WIDTH_DEMANGLED: usize = 54;
-const COL_WIDTH_UNIT: usize = 42;
+const COL_WIDTH_DEMANGLED: usize = 80;
+const COL_WIDTH_UNIT: usize = 46;
 const COL_WIDTH_SIZE: usize = 6;
 const COL_WIDTH_PCT: usize = 7;
 const COL_WIDTH_ADDR: usize = 6;
@@ -279,16 +278,12 @@ fn status_str(entry: &report_stats::FuncEntry) -> String {
 }
 
 fn print_list_table(functions: &[&report_stats::FuncEntry], total: usize) {
-    let has_demangled = functions.iter().any(|f| f.demangled.is_some());
     let has_enriched = functions.iter().any(|f| f.enriched.is_some());
     let has_struct = functions
         .iter()
         .any(|f| f.enriched.as_ref().and_then(|e| e.structure.as_ref()).is_some());
 
-    if has_demangled {
-        print!("{:<COL_WIDTH_DEMANGLED$}  ", "DEMANGLED");
-    }
-    print!("{:<COL_WIDTH_NAME$}  ", "MANGLED");
+    print!("{:<COL_WIDTH_DEMANGLED$}  ", "FUNCTION");
     print!("{:<COL_WIDTH_UNIT$}  ", "UNIT");
     print!("{:>COL_WIDTH_SIZE$}  ", "SIZE");
     print!("{:>COL_WIDTH_PCT$}  ", "MATCH%");
@@ -304,13 +299,10 @@ fn print_list_table(functions: &[&report_stats::FuncEntry], total: usize) {
     println!();
 
     for f in functions {
-        if has_demangled {
-            print!(
-                "{:<COL_WIDTH_DEMANGLED$}  ",
-                ellipsis(f.demangled.as_deref().unwrap_or("-"), COL_WIDTH_DEMANGLED)
-            );
-        }
-        print!("{:<COL_WIDTH_NAME$}  ", ellipsis(&f.name, COL_WIDTH_NAME));
+        print!(
+            "{:<COL_WIDTH_DEMANGLED$}  ",
+            ellipsis(f.demangled.as_deref().unwrap_or("-"), COL_WIDTH_DEMANGLED)
+        );
         print!("{:<COL_WIDTH_UNIT$}  ", ellipsis(&f.unit, COL_WIDTH_UNIT));
         print!("{:>COL_WIDTH_SIZE$}  ", format!("0x{:x}", f.size));
         print!("{:>COL_WIDTH_PCT$}  ", pct_str(f.fuzzy_match_percent));
@@ -355,14 +347,9 @@ fn print_orphan_table(
     target_only: Option<&[report_stats::IndexEntry]>,
     has_classifications: bool,
 ) {
-    let has_demangled = functions.iter().any(|f| f.demangled.is_some());
-
     if !functions.is_empty() {
         println!("=== report.json (no fuzzy_match_percent) ===");
-        if has_demangled {
-            print!("{:<COL_WIDTH_DEMANGLED$}  ", "DEMANGLED");
-        }
-        print!("{:<COL_WIDTH_NAME$}  ", "MANGLED");
+        print!("{:<COL_WIDTH_DEMANGLED$}  ", "FUNCTION");
         print!("{:<COL_WIDTH_UNIT$}  ", "UNIT");
         print!("{:>COL_WIDTH_SIZE$}  ", "SIZE");
         if has_classifications {
@@ -372,13 +359,10 @@ fn print_orphan_table(
         println!();
 
         for f in functions {
-            if has_demangled {
-                print!(
-                    "{:<COL_WIDTH_DEMANGLED$}  ",
-                    ellipsis(f.demangled.as_deref().unwrap_or("-"), COL_WIDTH_DEMANGLED)
-                );
-            }
-            print!("{:<COL_WIDTH_NAME$}  ", ellipsis(&f.name, COL_WIDTH_NAME));
+            print!(
+                "{:<COL_WIDTH_DEMANGLED$}  ",
+                ellipsis(f.demangled.as_deref().unwrap_or(&f.name), COL_WIDTH_DEMANGLED)
+            );
             print!("{:<COL_WIDTH_UNIT$}  ", ellipsis(&f.unit, COL_WIDTH_UNIT));
             print!("{:>COL_WIDTH_SIZE$}  ", format!("0x{:x}", f.size));
             if has_classifications {
@@ -412,15 +396,13 @@ fn print_orphan_table(
 }
 
 fn print_index_only_table(entries: &[report_stats::IndexEntry]) {
-    print!("{:<COL_WIDTH_NAME$}  ", "MANGLED");
-    print!("{:<COL_WIDTH_DEMANGLED$}  ", "DEMANGLED");
+    print!("{:<COL_WIDTH_DEMANGLED$}  ", "FUNCTION");
     print!("{:>COL_WIDTH_SIZE$}  ", "SIZE");
     print!("{:>COL_WIDTH_RVA$}  ", "RVA");
     print!("{:<COL_WIDTH_FILE$}", "FILE");
     println!();
 
     for e in entries {
-        print!("{:<COL_WIDTH_NAME$}  ", ellipsis(&e.mangled, COL_WIDTH_NAME));
         print!(
             "{:<COL_WIDTH_DEMANGLED$}  ",
             ellipsis(&e.name, COL_WIDTH_DEMANGLED)
@@ -433,13 +415,16 @@ fn print_index_only_table(entries: &[report_stats::IndexEntry]) {
 }
 
 fn print_classify_table(entries: &[orphan_classify::ClassEntry]) {
-    print!("{:<COL_WIDTH_NAME$}  ", "MANGLED");
+    print!("{:<COL_WIDTH_DEMANGLED$}  ", "MANGLED");
     print!("{:<COL_WIDTH_STATUS$}  ", "STATUS");
-    print!("{:>COL_WIDTH_SIZE$}  ", "REASON");
+    print!("  REASON");
     println!();
 
     for e in entries {
-        print!("{:<COL_WIDTH_NAME$}  ", ellipsis(&e.mangled, COL_WIDTH_NAME));
+        print!(
+            "{:<COL_WIDTH_DEMANGLED$}  ",
+            ellipsis(&e.mangled, COL_WIDTH_DEMANGLED)
+        );
         print!("{:<COL_WIDTH_STATUS$}  ", e.status);
         print!("  {}", e.reason.as_deref().unwrap_or("-"));
         println!();
