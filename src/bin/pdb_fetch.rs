@@ -386,9 +386,9 @@ fn describe_selector(cli: &Cli) -> String {
 
 /// Audit log: append one tab-separated line per invocation -
 /// `<timestamp>  <git-branch>  <all flags>` - so the agent's tool usage (which
-/// view, which function/address, from which worktree, when) is reviewable. These
-/// reads are fast, so execution time is not recorded. Logs on Drop, so it fires
-/// for any normal completion.
+/// tool, which view, which function/address, from which worktree, when) is
+/// reviewable. These reads are fast, so execution time is not recorded. Logs on
+/// Drop, so it fires for any normal completion. The first "flag" is argv[0].
 struct LogGuard {
     when: chrono::DateTime<chrono::Local>,
     path: Option<PathBuf>,
@@ -409,7 +409,7 @@ impl Drop for LogGuard {
             return;
         };
         use chrono::Timelike as _;
-        let args: Vec<String> = std::env::args().skip(1).collect();
+        let args: Vec<String> = std::env::args().collect();
         let line = format!(
             "[{}.{:02}][{}]: {}\n",
             self.when.format("%Y-%m-%d %H:%M:%S"),
