@@ -204,6 +204,10 @@ impl<'a> Module<'a> {
                         continue;
                     };
 
+                    if proc.type_index == pdb::TypeIndex(0) {
+                        continue;
+                    }
+
                     filename = file_name.to_string();
                     // TODO: Skip creating function here. We already have a filename to know
                     // whether it will be written to `structure` or not.
@@ -554,9 +558,13 @@ impl<'a> Module<'a> {
         let source_path_len = source_path.as_path().as_os_str().len();
 
         for (file, funs) in self.files {
-            let Some(path_to_file) = file.strip_prefix(engine_path) else {
+            if file.len() < engine_path.len(){
                 continue;
-            };
+            }
+            if !str::from_utf8(file.as_bytes())?[0..engine_path.len()].eq_ignore_ascii_case(engine_path){
+                continue;
+            }
+            let path_to_file = &str::from_utf8(file.as_bytes())?[engine_path.len()..];
 
             let extension = match () {
                 () if path_to_file.ends_with(".h") => ".h",

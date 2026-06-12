@@ -127,7 +127,7 @@ impl<'a, 's> PdbParser<'a, 's> {
         type_index: pdb::TypeIndex,
     ) -> crate::Result<String> {
         let mut name = String::new();
-        self.formatter_orig.emit_function(
+        self.formatter.emit_function(
             &mut name,
             proc_name.to_string().as_str(),
             module_id,
