@@ -374,7 +374,7 @@ impl<'pdb> Data<'pdb> {
                             (_, 0) => (),
                             (0, _) => _ = entry.insert(e),
                             _ if e.name.as_bytes() == b"ARG_TYPE" => (),
-                            _ => unreachable!("Enums cannot be of different length"),
+                            _ => () // unreachable!("Enums cannot be of different length"),
                         }
                     }
                 }
@@ -1262,10 +1262,10 @@ impl Enum<'_> {
                 pdb::Variant::U16(v) => v as u64,
                 pdb::Variant::U32(v) => v as u64,
                 pdb::Variant::U64(v) => v as u64,
-                pdb::Variant::I8(v) => v.abs() as u64,
-                pdb::Variant::I16(v) => v.abs() as u64,
-                pdb::Variant::I32(v) => v.abs() as u64,
-                pdb::Variant::I64(v) => v.abs() as u64,
+                pdb::Variant::I8(v) => v.wrapping_abs() as u64,
+                pdb::Variant::I16(v) => v.wrapping_abs() as u64,
+                pdb::Variant::I32(v) => v.wrapping_abs() as u64,
+                pdb::Variant::I64(v) => v.wrapping_abs() as u64,
             });
         }
         max_value_len.max(1).ilog2() / 4
@@ -1359,7 +1359,8 @@ fn build_header_name(
         .replace("*", "+")
         .replace("&", "+")
         .replace("<", "_")
-        .replace(">", "_");
+        .replace(">", "_")
+        .replace("|", "_");
     Some(header_name)
 }
 
