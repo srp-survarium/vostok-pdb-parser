@@ -110,14 +110,28 @@ pub fn dump_sources(
             continue;
         };
 
-        let module = Module::build(
+        // A module that links against a library shipped without full debug info
+        // (e.g. the vendored Scaleform GFx .lib) can have cross-module type
+        // references the PDB cannot resolve, and `Module::build` fails reading
+        // them (UnexpectedEof). One such compiland must not abort the whole
+        // dump: warn, skip it, and carry on with the rest.
+        let module = match Module::build(
             &module_info,
             module_id,
             formatter,
             &address_map,
             &string_table,
             flags,
-        )?;
+        ) {
+            Ok(module) => module,
+            Err(error) => {
+                eprintln!(
+                    "warning: skipping module {module_id} '{}': {error}",
+                    module.module_name(),
+                );
+                continue;
+            }
+        };
 
         module.update_cache(&mut cache, flags);
         module.write(&mut output_path, &mut source_path, engine_path, files)?;
