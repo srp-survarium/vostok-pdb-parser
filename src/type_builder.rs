@@ -52,7 +52,7 @@ impl Namespace {
                 (Some("ai"),        Some("sensors"))          => subclass,
                 (Some("animation"), Some("mixing"))           => subclass,
                 (Some("core"),      Some("configs"))          => subclass,
-                (Some("memory"),    Some("detai"))            => subclass,
+                (Some("memory"),    Some("detail"))           => subclass,
                 (Some("render"),    Some("culling"))          => subclass,
                 (Some("render"),    Some("debug"))            => subclass,
                 _ => None,
