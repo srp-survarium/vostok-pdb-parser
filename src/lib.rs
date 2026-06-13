@@ -3,6 +3,7 @@
 #![feature(trim_prefix_suffix)]
 #![expect(clippy::len_without_is_empty)]
 
+pub mod declarations;
 pub mod dump_pdb;
 pub mod gen_headers;
 pub mod gen_sources;
