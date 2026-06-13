@@ -61,12 +61,26 @@ pub struct Statement {
 //
 //
 
+/// Does this compiland's object-file path match any caller-supplied exclusion?
+///
+/// The PDB stores backslash, mixed-case object paths; we normalize to lowercase
+/// with forward slashes so the globs can be written portably (e.g.
+/// `**/scaleform/src/**`) regardless of the original separator.
+fn is_excluded(module_name: &str, excludes: &globset::GlobSet) -> bool {
+    if excludes.is_empty() {
+        return false;
+    }
+    let path = module_name.to_lowercase().replace('\\', "/");
+    excludes.is_match(&path)
+}
+
 pub fn dump_sources(
     pdb: &mut pdb::PDB<std::fs::File>,
     formatter: &PdbParser,
     output_path: &std::path::Path,
     engine_path: &str,
     flags: GenFlags,
+    excludes: &globset::GlobSet,
     files: &mut Files,
 ) -> crate::Result<FunctionCache> {
     let address_map = pdb.address_map()?;
@@ -85,7 +99,9 @@ pub fn dump_sources(
     while let Some(module) = modules.next()? {
         module_id = module_id.wrapping_add(1);
 
-        if module.module_name().contains("\\scaleform\\") {
+        // Caller-supplied exclusions (e.g. a vendored third-party tree); policy
+        // lives with the caller, not in the tool.
+        if is_excluded(&module.module_name().to_string(), excludes) {
             continue;
         }
 
@@ -953,4 +969,47 @@ fn assume_namespace(funs: &BTreeMap<u32, Function>) -> Namespace {
     }
 
     namespace
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_excluded;
+
+    fn globset(patterns: &[&str]) -> globset::GlobSet {
+        let mut builder = globset::GlobSetBuilder::new();
+        for p in patterns {
+            builder.add(globset::Glob::new(&p.to_lowercase()).unwrap());
+        }
+        builder.build().unwrap()
+    }
+
+    // The vendored GFx tree lives under `…\scaleform\src\…`; the engine's own
+    // integration layer lives under `…\vostok\scaleform\sources\…`. The earlier
+    // hardcoded `\scaleform\` substring ate both — an anchored glob must not.
+    #[test]
+    fn excludes_vendored_gfx_but_keeps_engine_wrapper() {
+        let excludes = globset(&["**/scaleform/src/**"]);
+
+        // dropped: third-party GFx compilands
+        assert!(is_excluded(
+            r"c:\survarium\sources\scaleform\src\gfx\gfx_player.obj",
+            &excludes,
+        ));
+        // kept: engine wrapper that merely has "scaleform" in its path
+        assert!(!is_excluded(
+            r"c:\survarium\sources\vostok\scaleform\sources\command_queue.obj",
+            &excludes,
+        ));
+        // kept: the false-positive sibling from the bug report
+        assert!(!is_excluded(
+            r"c:\survarium\sources\vostok\engine\sources\engine_scaleform_initialize.obj",
+            &excludes,
+        ));
+    }
+
+    #[test]
+    fn empty_excludes_match_nothing() {
+        let none = globset(&[]);
+        assert!(!is_excluded(r"c:\anything\scaleform\src\x.obj", &none));
+    }
 }

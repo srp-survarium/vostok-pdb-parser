@@ -9,6 +9,7 @@ fn main() {
         as_base,
         no_cache,
         skip_non_engine_headers,
+        exclude_path,
     } = Cli::parse();
 
     let flags = {
@@ -24,9 +25,13 @@ fn main() {
         engine_path.push('\\');
     }
 
-    if let Err(error) =
-        vostok_pdb_parser::dump_pdb::dump_pdb(&pdb_path, &output_path, &engine_path, flags)
-    {
+    if let Err(error) = vostok_pdb_parser::dump_pdb::dump_pdb(
+        &pdb_path,
+        &output_path,
+        &engine_path,
+        flags,
+        &exclude_path,
+    ) {
         eprintln!("{error}");
         std::process::exit(1);
     }

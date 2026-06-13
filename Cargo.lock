@@ -1040,6 +1040,7 @@ dependencies = [
  "chrono",
  "clap",
  "digest",
+ "globset",
  "iced-x86",
  "md-5",
  "objdiff-core",

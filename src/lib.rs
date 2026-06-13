@@ -60,6 +60,13 @@ pub struct Cli {
 
     #[arg(long, action)]
     pub skip_non_engine_headers: bool,
+
+    /// Glob matched against each compiland's object-file path (normalized to
+    /// lowercase with forward slashes) to suppress its source stub. Repeatable.
+    /// E.g. `--exclude-path '**/scaleform/src/**'` drops the vendored GFx tree
+    /// while keeping the engine's own `vostok/scaleform/` wrappers.
+    #[arg(long, value_name = "GLOB")]
+    pub exclude_path: Vec<String>,
 }
 
 bitflags::bitflags! {
