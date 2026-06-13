@@ -16,6 +16,7 @@ sha1 = "0.10"
 sha2 = "0.10"
 digest = "0.10"
 bitflags = "2.9.2"
+globset = "0.4.18"
 chrono = "0.4.42"
 uuid = { version = "1.18.1", features = ["v4"] }
 

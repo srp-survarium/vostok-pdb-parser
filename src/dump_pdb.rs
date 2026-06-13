@@ -18,10 +18,21 @@ pub fn dump_pdb(
     output_path: &path::Path,
     engine_path: &str,
     flags: GenFlags,
+    exclude_path: &[String],
 ) -> crate::Result<()> {
     if output_path.as_os_str().as_encoded_bytes().is_empty() {
         panic!("output_path cannot be empty")
     }
+
+    // Compilands whose (normalized) object-file path matches any of these are
+    // skipped by `dump_sources`. Policy lives with the caller, not in the tool.
+    let excludes = {
+        let mut builder = globset::GlobSetBuilder::new();
+        for pattern in exclude_path {
+            builder.add(globset::Glob::new(&pattern.to_lowercase())?);
+        }
+        builder.build()?
+    };
 
     {
         let mut path = output_path.to_path_buf();
@@ -45,8 +56,15 @@ pub fn dump_pdb(
         let file = fs::File::open(pdb_path)?;
         let mut pdb = PDB::open(file)?;
 
-        let cache =
-            gen_sources::dump_sources(&mut pdb, &fmt, output_path, engine_path, flags, &mut files)?;
+        let cache = gen_sources::dump_sources(
+            &mut pdb,
+            &fmt,
+            output_path,
+            engine_path,
+            flags,
+            &excludes,
+            &mut files,
+        )?;
         gen_headers::dump_headers(&mut pdb, &fmt, cache, output_path, flags, &mut files)?;
 
         Ok(())
