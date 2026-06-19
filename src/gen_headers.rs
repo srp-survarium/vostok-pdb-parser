@@ -373,8 +373,16 @@ impl<'pdb> Data<'pdb> {
                             (lhs, rhs) if lhs == rhs => (),
                             (_, 0) => (),
                             (0, _) => _ = entry.insert(e),
-                            _ if e.name.as_bytes() == b"ARG_TYPE" => (),
-                            _ => unreachable!("Enums cannot be of different length"),
+                            // Distinct enums that share an unqualified name across namespaces
+                            // (e.g. lobby:: vs messaging::client_state_enum, or ARG_TYPE): keep
+                            // the first. The structure dump only needs the type to exist;
+                            // enumerator names are cosmetic for binary matching, so a length
+                            // mismatch here is expected, not a bug to abort the whole dump on.
+                            _ => eprintln!(
+                                "warning: enum `{}` seen with differing enumerator counts across \
+                                 namespaces; keeping first",
+                                e.name
+                            ),
                         }
                     }
                 }
