@@ -49,14 +49,22 @@ pub fn dump_headers(
     let mut enums = BTreeMap::new();
 
     while let Some(type_index) = type_iter.next()? {
-        let Ok(pdb::TypeData::Class(class)) = type_index.parse() else {
-            continue;
+        // Classes/structs and (now) top-level unions both get a dedicated header.
+        // Nested unions are skipped here - like nested enums they belong inside
+        // their owning class's header, not standalone.
+        let (name, header_type) = match type_index.parse() {
+            Ok(pdb::TypeData::Class(class)) if !class.properties.forward_reference() => {
+                (class.name, HeaderType::Class)
+            }
+            Ok(pdb::TypeData::Union(u))
+                if !u.properties.forward_reference() && !u.properties.is_nested_type() =>
+            {
+                (u.name, HeaderType::Union)
+            }
+            _ => continue,
         };
-        if class.properties.forward_reference() {
-            continue;
-        }
 
-        let namespace = Namespace::get_from_class_name_impl(&class.name.to_string());
+        let namespace = Namespace::get_from_class_name_impl(&name.to_string());
 
         let Ok(header) = build_header(
             formatter,
@@ -70,23 +78,83 @@ pub fn dump_headers(
         };
 
         if let Some(file) = create_header_file(
-            &class.name,
+            &name,
             &namespace,
-            HeaderType::Class,
+            header_type,
             &mut output_path,
             &mut header_path,
             flags,
             files,
         )? {
             let mut file = BufWriter::new(file);
-            header.write_to_header_file(&class.name.to_string(), &mut file)?;
+            header.write_to_header_file(&name.to_string(), &mut file)?;
         }
 
         output_path.as_mut_os_string().truncate(output_path_len);
         header_path.as_mut_os_string().truncate(header_path_len);
     }
 
+    // The class walk above only captures enums reachable as a needed type from
+    // some emitted class (a member field, template argument, etc.). An enum used
+    // solely as a function-parameter type, switch scrutinee or u8->enum cast is
+    // never visited, so its member list would be lost even though the PDB defines
+    // it in full. Walk the type stream directly and surface every named enum.
+    // Same dedup rule as the reachable path: a populated definition wins over a
+    // fieldless forward reference; the first of two genuinely distinct same-named
+    // enums is kept.
+    let mut enum_iter = type_information.iter();
+    while let Some(type_index) = enum_iter.next()? {
+        let Ok(pdb::TypeData::Enumeration(data)) = type_index.parse() else {
+            continue;
+        };
+        // Skip fieldless forward references and enums nested in a class (the
+        // latter are emitted within their owning class's header, not standalone).
+        if data.properties.forward_reference() || data.properties.is_nested_type() {
+            continue;
+        }
+
+        let namespace = Namespace::get_from_class_name_impl(&data.name.to_string());
+        let mut needed_types = TypeSet::new();
+        let Ok(underlying_type_name) = type_name(
+            formatter,
+            &type_finder,
+            data.underlying_type,
+            &mut needed_types,
+            &namespace,
+        ) else {
+            continue;
+        };
+
+        let mut e = Enum {
+            name: data.name,
+            underlying_type_name,
+            values: Vec::new(),
+            is_nested: false,
+        };
+        if e.add_fields(&type_finder, data.fields, &mut needed_types)
+            .is_err()
+        {
+            continue;
+        }
+
+        match enums.entry(e.name) {
+            btree_map::Entry::Vacant(entry) => _ = entry.insert(e),
+            btree_map::Entry::Occupied(mut entry) => {
+                match (entry.get().values.len(), e.values.len()) {
+                    (lhs, rhs) if lhs == rhs => (),
+                    (_, 0) => (),
+                    (0, _) => _ = entry.insert(e),
+                    _ => (),
+                }
+            }
+        }
+    }
+
     for e in enums.values() {
+        if e.is_nested {
+            continue;
+        }
+
         let enum_name = &e.name.to_string();
         let namespace = Namespace::get_from_class_name_impl(enum_name);
 
@@ -100,7 +168,7 @@ pub fn dump_headers(
             files,
         )? {
             let mut file = BufWriter::new(file);
-            e.write_to_header_file(enum_name, &namespace, &mut file)?;
+            e.write_to_header_file(enum_name, &mut file)?;
         }
 
         output_path.as_mut_os_string().truncate(output_path_len);
@@ -174,6 +242,10 @@ struct Class<'p> {
     fields: Vec<Field<'p>>,
     instance_methods: Vec<Method>,
     static_methods: Vec<Method>,
+    // A union reuses the class renderer: same member list, but emitted with the
+    // `union` keyword and no base classes. `kind` is set to Struct so members
+    // print public.
+    is_union: bool,
 }
 
 struct BaseClass {
@@ -203,6 +275,11 @@ struct Enum<'p> {
     name: pdb::RawString<'p>,
     underlying_type_name: Type,
     values: Vec<EnumValue<'p>>,
+    // Enum nested inside a class/struct (CV `isnested`). Such enums belong in
+    // their enclosing class's header; emitting them standalone would produce an
+    // invalid `enum outer::inner { ... };` definition, so the dedicated-header
+    // writer skips them. They still render inline within the owning class.
+    is_nested: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -223,6 +300,7 @@ enum ForwardReferenceKind {
     Class,
     Struct,
     Enum,
+    Union,
     Unknown,
     Typedef,
     TypedefInner,
@@ -334,6 +412,7 @@ impl<'pdb> Data<'pdb> {
                     base_classes: Vec::new(),
                     instance_methods: Vec::new(),
                     static_methods: Vec::new(),
+                    is_union: false,
                 };
 
                 if let Some(fields) = data.fields {
@@ -361,6 +440,7 @@ impl<'pdb> Data<'pdb> {
                         &self.namespace,
                     )?,
                     values: Vec::new(),
+                    is_nested: data.properties.is_nested_type(),
                 };
 
                 e.add_fields(type_finder, data.fields, needed_types)?;
@@ -373,14 +453,65 @@ impl<'pdb> Data<'pdb> {
                             (lhs, rhs) if lhs == rhs => (),
                             (_, 0) => (),
                             (0, _) => _ = entry.insert(e),
-                            _ if e.name.as_bytes() == b"ARG_TYPE" => (),
-                            _ => unreachable!("Enums cannot be of different length"),
+                            // Distinct enums that share an unqualified name across namespaces
+                            // (e.g. lobby:: vs messaging::client_state_enum, or ARG_TYPE): keep
+                            // the first. The structure dump only needs the type to exist;
+                            // enumerator names are cosmetic for binary matching, so a length
+                            // mismatch here is expected, not a bug to abort the whole dump on.
+                            _ => eprintln!(
+                                "warning: enum `{}` seen with differing enumerator counts across \
+                                 namespaces; keeping first",
+                                e.name
+                            ),
                         }
                     }
                 }
             }
 
-            pdb::TypeData::Union(_) => (/* TODO */),
+            pdb::TypeData::Union(data) => {
+                let namespace = &self.namespace;
+
+                if data.properties.forward_reference() {
+                    let name = data.name.to_string();
+                    if let Some(name) = skip_default_environment(&name) {
+                        _ = self.forward_references.insert(
+                            name.to_string(),
+                            ForwardReference {
+                                kind: ForwardReferenceKind::Union,
+                                usage: ForwardReferenceUsage::ByValue,
+                                name: name.to_string(),
+                            },
+                        );
+                    }
+                    return Ok(());
+                }
+
+                let mut class = Class {
+                    namespace: namespace.clone(),
+                    kind: pdb::ClassKind::Struct,
+                    name: Type::new(&data.name.to_string(), namespace),
+                    orig_name: data.name.to_string().to_string(),
+                    size: data.size,
+                    fields: Vec::new(),
+                    base_classes: Vec::new(),
+                    instance_methods: Vec::new(),
+                    static_methods: Vec::new(),
+                    is_union: true,
+                };
+
+                if data.count > 0 {
+                    class.add_fields(
+                        formatter,
+                        cache,
+                        type_finder,
+                        data.fields,
+                        needed_types,
+                        &mut self.forward_references,
+                    )?;
+                }
+
+                self.classes.insert(0, class);
+            }
 
             // ignore
             other => eprintln!("warning: don't know how to add {other:?}"),
@@ -877,20 +1008,59 @@ impl Enum<'_> {
     fn write_to_header_file(
         &self,
         enum_name: &str,
-        namespace: &Namespace,
         f: &mut impl std::io::Write,
     ) -> crate::Result<()> {
         let ifdef_name = get_ifdef_name(enum_name);
 
+        // A non-nested enum's qualified prefix is purely namespaces (any class
+        // scope would make it nested, and nested enums are filtered out before
+        // we get here), so wrap each component directly from the name. This is
+        // namespace-agnostic - it handles engine roots (vostok::/survarium::) and
+        // game namespaces the engine-root model ignores (lobby::, messaging::)
+        // alike, and a global enum (no `::`) gets no wrapper.
+        let (namespaces, leaf) = split_qualified(enum_name);
+
         gen_sources::write_header(f, &ifdef_name)?;
-        namespace.start_namespace(f)?;
-        self.fmt(Name::RemoveNamespace(namespace), f)?;
+        for ns in &namespaces {
+            writeln!(f, "namespace {ns} {{")?;
+        }
+        if !namespaces.is_empty() {
+            writeln!(f)?;
+        }
+        self.fmt(Name::Bare(leaf), f)?;
         writeln!(f)?;
-        namespace.end_namespace(f)?;
+        for ns in namespaces.iter().rev() {
+            writeln!(f, "}} // namespace {ns}")?;
+        }
         gen_sources::write_footer(f, &ifdef_name)?;
 
         Ok(())
     }
+}
+
+// Split a fully-qualified type name into its namespace components and trailing
+// bare name, ignoring `::` nested inside template arguments.
+fn split_qualified(name: &str) -> (Vec<&str>, &str) {
+    let bytes = name.as_bytes();
+    let mut depth = 0i32;
+    let mut comps = Vec::new();
+    let mut start = 0usize;
+    let mut i = 0usize;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'<' => depth += 1,
+            b'>' => depth -= 1,
+            b':' if depth == 0 && bytes.get(i + 1) == Some(&b':') => {
+                comps.push(&name[start..i]);
+                i += 2;
+                start = i;
+                continue;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    (comps, &name[start..])
 }
 
 fn get_ifdef_name(name: &str) -> String {
@@ -942,10 +1112,14 @@ impl Data<'_> {
 
 impl Class<'_> {
     fn fmt(&self, f: &mut impl std::io::Write) -> io::Result<()> {
-        let kind = match self.kind {
-            pdb::ClassKind::Class => "class",
-            pdb::ClassKind::Struct => "struct",
-            pdb::ClassKind::Interface => "interface",
+        let kind = if self.is_union {
+            "union"
+        } else {
+            match self.kind {
+                pdb::ClassKind::Class => "class",
+                pdb::ClassKind::Struct => "struct",
+                pdb::ClassKind::Interface => "interface",
+            }
         };
         let name = &self.name;
         write!(f, "{kind} {name}")?;
@@ -1194,7 +1368,7 @@ impl Method {
 
 enum Name<'a> {
     Full,
-    RemoveNamespace(&'a Namespace),
+    Bare(&'a str),
 }
 
 impl Enum<'_> {
@@ -1206,8 +1380,8 @@ impl Enum<'_> {
             Name::Full => {
                 writeln!(f, "enum {}\n{{", self.name.to_string())?;
             }
-            Name::RemoveNamespace(ns) => {
-                writeln!(f, "enum {}\n{{", ns.strip(&self.name.to_string()))?;
+            Name::Bare(leaf) => {
+                writeln!(f, "enum {leaf}\n{{")?;
             }
         }
 
@@ -1281,6 +1455,7 @@ impl ForwardReference {
                 ForwardReferenceKind::Class => "class",
                 ForwardReferenceKind::Struct => "struct",
                 ForwardReferenceKind::Enum => "enum",
+                ForwardReferenceKind::Union => "union",
                 ForwardReferenceKind::Unknown => "class",
                 ForwardReferenceKind::Typedef => "typedef",
                 ForwardReferenceKind::TypedefInner => "class",
@@ -1296,6 +1471,7 @@ impl ForwardReference {
 
 enum HeaderType {
     Enum,
+    Union,
     Class,
 }
 
@@ -1348,6 +1524,7 @@ fn build_header_name(
 
     match header_type {
         HeaderType::Enum => header_path.push("enums"),
+        HeaderType::Union => header_path.push("unions"),
         HeaderType::Class => (),
     }
 
