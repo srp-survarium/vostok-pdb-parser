@@ -258,16 +258,57 @@ struct Field<'p> {
     name: pdb::RawString<'p>,
     array: String,
     offset: u64,
+    // CV_access_t: 0=unspecified, 1=private, 2=protected, 3=public.
+    access: u8,
 }
 
 enum Method {
     FromHeaderFile {
         fn_t: type_parser::Function,
+        // CV_access_t (see Field::access)
+        access: u8,
     },
     FromSourceFile {
         fn_t: type_parser::Function,
         margs: Vec<(String, Type)>,
+        access: u8,
     },
+}
+
+// CV_access_t -> the C++ access keyword. `unspecified` (0, only seen on globals
+// / non-member contexts) is treated as the class default by the caller.
+fn access_keyword(access: u8) -> Option<&'static str> {
+    match access {
+        1 => Some("private"),
+        2 => Some("protected"),
+        3 => Some("public"),
+        _ => None,
+    }
+}
+
+// The access a `class`/`struct`/`union` member has by default (CV_access_t).
+fn default_access(kind: pdb::ClassKind) -> u8 {
+    match kind {
+        // A `class` (and MSVC `interface`) defaults to private members.
+        pdb::ClassKind::Class | pdb::ClassKind::Interface => 1,
+        // A `struct` (and `union`, which reuses this renderer with kind=Struct)
+        // defaults to public members.
+        pdb::ClassKind::Struct => 3,
+    }
+}
+
+// Emit a `private:`/`protected:`/`public:` section label when the next member's
+// access differs from the access region we are currently in, mirroring how a
+// real C++ header groups members. `member` of 0 (unspecified, e.g. compiler
+// thunks) inherits the current region and never forces a label.
+fn emit_access_label(f: &mut impl std::io::Write, current: &mut u8, member: u8) -> io::Result<()> {
+    if member != 0 && member != *current {
+        if let Some(keyword) = access_keyword(member) {
+            writeln!(f, "{keyword}:")?;
+            *current = member;
+        }
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -589,6 +630,7 @@ impl<'p> Class<'p> {
                     )?,
                     data.name,
                     data.offset,
+                    data.attributes.access(),
                 ));
             }
 
@@ -766,14 +808,18 @@ impl Method {
             pdb::TypeData::MemberFunction(_) => {
                 assert!(!type_index.is_cross_module());
 
+                let access = attributes.access();
                 let mut method =
                     match cache.get_from_header(class_name, &name, formatter, type_index)? {
                         None => Method::FromHeaderFile {
                             fn_t: formatter.parse_function(&name, 0, type_index)?,
+                            access,
                         },
-                        Some(FunctionSignature { fn_t, margs }) => {
-                            Method::FromSourceFile { fn_t, margs }
-                        }
+                        Some(FunctionSignature { fn_t, margs }) => Method::FromSourceFile {
+                            fn_t,
+                            margs,
+                            access,
+                        },
                     };
 
                 method.set_method_attributes(attributes);
@@ -790,7 +836,9 @@ impl Method {
 
     fn set_method_attributes(&mut self, attrs: pdb::FieldAttributes) {
         match self {
-            Self::FromHeaderFile { fn_t } => pdb_parser::set_method_attributes(fn_t, attrs, false),
+            Self::FromHeaderFile { fn_t, .. } => {
+                pdb_parser::set_method_attributes(fn_t, attrs, false)
+            }
             Self::FromSourceFile { fn_t, .. } => {
                 pdb_parser::set_method_attributes(fn_t, attrs, true)
             }
@@ -843,7 +891,7 @@ impl<'p> Enum<'p> {
 }
 
 impl<'p> Field<'p> {
-    pub fn build(mut type_name: Type, name: pdb::RawString<'p>, offset: u64) -> Self {
+    pub fn build(mut type_name: Type, name: pdb::RawString<'p>, offset: u64, access: u8) -> Self {
         let mut array = String::new();
         if let Some(pos) = type_name.0.find('[') {
             array = type_name.0.split_at(pos).1.to_string();
@@ -855,6 +903,7 @@ impl<'p> Field<'p> {
             name,
             array,
             offset,
+            access,
         }
     }
 }
@@ -1136,14 +1185,13 @@ impl Class<'_> {
 
         writeln!(f, " {{")?;
 
-        //
-        // All methods are considered public
-        //
-        if !self.instance_methods.is_empty() || !self.static_methods.is_empty() {
-            if !matches!(self.kind, pdb::ClassKind::Struct) {
-                writeln!(f, "public:")?;
-            }
+        // Track the access region we are currently in (CV_access_t), so we emit
+        // a `private:`/`protected:`/`public:` label only when it changes - the
+        // way a real header groups members. A union reuses this renderer with
+        // kind=Struct, so it starts public like a struct.
+        let mut current_access = default_access(self.kind);
 
+        if !self.instance_methods.is_empty() || !self.static_methods.is_empty() {
             let max_return_type_len = self.max_return_type_len();
             let max_method_name_len = self.max_method_name_len();
 
@@ -1175,6 +1223,8 @@ impl Class<'_> {
                         _ => writeln!(f)?,
                     };
 
+                    emit_access_label(f, &mut current_access, method.access())?;
+
                     method.fmt(
                         f,
                         &self.namespace,
@@ -1191,6 +1241,8 @@ impl Class<'_> {
                 writeln!(f)?;
 
                 for method in &self.static_methods {
+                    emit_access_label(f, &mut current_access, method.access())?;
+
                     method.fmt(
                         f,
                         &self.namespace,
@@ -1205,15 +1257,6 @@ impl Class<'_> {
         if !self.fields.is_empty() {
             writeln!(f)?;
 
-            //
-            // All fields are considered public unless this is a struct
-            //
-            match self.kind {
-                pdb::ClassKind::Class => writeln!(f, "private:")?,
-                pdb::ClassKind::Interface => writeln!(f, "private:")?,
-                pdb::ClassKind::Struct => writeln!(f, "public:")?,
-            }
-
             for base in &self.base_classes {
                 writeln!(f, "\t/* 0x{:04x} */\t/* {} */", base.offset, base.type_name)?;
             }
@@ -1224,8 +1267,11 @@ impl Class<'_> {
                 name,
                 array,
                 offset,
+                access,
             } in &self.fields
             {
+                emit_access_label(f, &mut current_access, *access)?;
+
                 write!(f, "\t/* 0x{offset:04x} */\t{type_name}")?;
                 formatter::pad_spaces_t(f, type_name.len(), max_type_name_len)?;
                 writeln!(f, "\t{}{};", name.to_string(), array)?;
@@ -1341,10 +1387,10 @@ impl Method {
         };
 
         match self {
-            Method::FromHeaderFile { fn_t } => {
+            Method::FromHeaderFile { fn_t, .. } => {
                 header_formatter.write_fn_signature_unnamed_args(fn_t, namespace, f)?;
             }
-            Method::FromSourceFile { fn_t, margs } => {
+            Method::FromSourceFile { fn_t, margs, .. } => {
                 formatter::Formatter::Header(header_formatter)
                     .write_fn_signature_with_args(fn_t, namespace, margs, f)?;
             }
@@ -1356,8 +1402,15 @@ impl Method {
 
     fn fn_t(&self) -> &type_parser::Function {
         match self {
-            Method::FromHeaderFile { fn_t } => fn_t,
+            Method::FromHeaderFile { fn_t, .. } => fn_t,
             Method::FromSourceFile { fn_t, .. } => fn_t,
+        }
+    }
+
+    fn access(&self) -> u8 {
+        match self {
+            Method::FromHeaderFile { access, .. } => *access,
+            Method::FromSourceFile { access, .. } => *access,
         }
     }
 
