@@ -1,6 +1,8 @@
+mod dyninit;
 mod files;
 mod function_cache;
 
+pub use dyninit::canonicalize_static_init_thunk;
 pub use files::Files;
 pub use function_cache::{FunctionCache, FunctionSignature};
 

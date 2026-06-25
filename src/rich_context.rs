@@ -309,9 +309,7 @@ pub fn dump_rich_context(pdb_path: &Path, exe_path: &Path, opts: &Options) -> cr
                                 _ => None,
                             };
 
-                            let signature = fmt
-                                .emit_function_orig(&proc.name, module_id, proc.type_index)
-                                .unwrap_or_else(|_| proc.name.to_string().into_owned());
+                            let proc_name = proc.name.to_string();
 
                             let file = rel.unwrap_or(file_name).replace('\\', "/");
                             // Decorated name for the objdiff/.obj join; module
@@ -320,7 +318,24 @@ pub fn dump_rich_context(pdb_path: &Path, exe_path: &Path, opts: &Options) -> cr
                                 .public_functions
                                 .get(&func_rva)
                                 .cloned()
-                                .unwrap_or_else(|| proc.name.to_string().into_owned());
+                                .unwrap_or_else(|| proc_name.clone().into_owned());
+
+                            // Static-init thunks (`??__E` / `??__F`) carry no
+                            // Public symbol, so `mangled` falls back to the
+                            // Procedure name: the raw mangled form on base, the
+                            // demangled `` `dynamic initializer for 'X'' `` form on
+                            // target. Canonicalize the base side to the target's
+                            // demangled form so objdiff pairs the same thunk.
+                            let canon_thunk =
+                                crate::helpers::canonicalize_static_init_thunk(&mangled);
+                            let mangled = canon_thunk.clone().unwrap_or(mangled);
+
+                            let signature = match &canon_thunk {
+                                Some(c) => c.clone(),
+                                None => fmt
+                                    .emit_function_orig(&proc.name, module_id, proc.type_index)
+                                    .unwrap_or_else(|_| proc_name.into_owned()),
+                            };
 
                             entries.push(build_function(
                                 signature, mangled, &symbols, image_base, text_rva, &text_data,

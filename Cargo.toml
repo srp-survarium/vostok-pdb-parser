@@ -9,6 +9,9 @@ clap = { version = "4.5.41", features = ["derive", "env"] }
 pdb = { package = "pdb2", git = "https://github.com/afranchuk/pdb", rev = "384c165" }
 pdb-addr2line = { git = "https://github.com/srp-survarium/pdb-addr2line", rev = "0a314d74db568fdd5a353e5df054655cc6d7cc17" }
 pdb-addr2line-orig = { package = "pdb-addr2line", version = "0.11.2" }
+# Canonicalize compiler static-init thunk symbols (??__E / ??__F) to the
+# UnDecorateSymbolName form the original-game PDB stores, so objdiff pairs them.
+msvc-demangler = "0.11.0"
 
 anyhow = "1.0"
 md-5 = "0.10"
