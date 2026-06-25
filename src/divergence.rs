@@ -29,6 +29,7 @@ use crate::GenFlags;
 use crate::Namespace;
 use crate::gen_sources;
 use crate::helpers::FunctionLocation;
+use crate::helpers::canonicalize_static_init_thunk;
 use crate::pdb_parser::PdbParser;
 
 /// Library namespace roots whose types are skipped by default (overridable with
@@ -102,6 +103,11 @@ struct FileModel {
 }
 
 struct FnModel {
+    /// Cross-PDB join key (see [`function_join_key`]): the decorated COFF symbol
+    /// when one exists, else a side-independent canonical form of `name_orig`.
+    /// `key` is identical on both sides for the same logical function; `name_orig`
+    /// is the demangled signature, kept for DISPLAY only.
+    key: String,
     name_orig: String,
     statement_count: usize,
     constants: Vec<ConstModel>,
@@ -419,6 +425,14 @@ fn extract_sources(
     cfg: &Config,
     out: &mut SideModel,
 ) -> crate::Result<()> {
+    // RVA -> decorated (mangled) COFF symbol, from function Public symbols. This
+    // is the cross-PDB join key: the same logical function carries an identical
+    // mangled symbol in both PDBs, whereas its DEMANGLED signature can differ
+    // between the two (each PDB's demangler renders template args differently —
+    // base drops the `enum`/`class`/`struct` keyword, target keeps it). Built
+    // before the source walk because both borrow `pdb`.
+    let public = public_function_symbols(pdb)?;
+
     gen_sources::for_each_function(pdb, fmt, GenFlags::empty(), |filename, fun| {
         // The header side already covers inline functions defined in `.h`; here
         // we only compare definition order within real compilands.
@@ -445,6 +459,9 @@ fn extract_sources(
             })
             .collect();
 
+        let mangled = public.get(&fun.offset.0).map(String::as_str);
+        let key = function_join_key(mangled, &fun.name_orig);
+
         out.files
             .entry(relative)
             .or_insert_with(|| FileModel {
@@ -452,11 +469,105 @@ fn extract_sources(
             })
             .functions
             .push(FnModel {
+                key,
                 name_orig: fun.name_orig.clone(),
                 statement_count: fun.statements.len(),
                 constants,
             });
     })
+}
+
+/// Build the `RVA -> decorated (mangled) symbol` map for *functions*, from the
+/// global stream's Public symbols. Module Procedure symbols carry only the
+/// undecorated `ns::func` form, so the decorated COFF name — the side-stable
+/// join key — comes from here.
+fn public_function_symbols(
+    pdb: &mut pdb::PDB<std::fs::File>,
+) -> crate::Result<HashMap<u32, String>> {
+    let address_map = pdb.address_map()?;
+    let global = pdb.global_symbols()?;
+
+    let mut map = HashMap::new();
+    let mut it = global.iter();
+    while let Some(sym) = it.next()? {
+        if let Ok(pdb::SymbolData::Public(p)) = sym.parse() {
+            if p.function {
+                if let Some(rva) = p.offset.to_rva(&address_map) {
+                    map.entry(rva.0)
+                        .or_insert_with(|| p.name.to_string().into_owned());
+                }
+            }
+        }
+    }
+    Ok(map)
+}
+
+/// The cross-PDB join key for one source function.
+///
+/// * When the function has a Public (decorated) symbol, use it verbatim — it is
+///   byte-identical across the two PDBs (the demangled signature is not).
+/// * Otherwise it is a compiler-generated static-init/atexit thunk (`??__E` /
+///   `??__F`), which carries no Public symbol and which the two PDBs render
+///   differently in `name_orig`: the base keeps the raw mangled `??__E…` form,
+///   the target stores a demangled `` `dynamic initializer for 'X'' `` form (and
+///   even the target's own rendering varies — a namespace-scope static comes out
+///   `` ns::`dynamic initializer for 'leaf'' `` while a class static comes out
+///   `` `dynamic initializer for 'qualified::leaf'' `` with no outer prefix).
+///   Normalize every variant to a single `kind|fully-qualified-var` key so the
+///   same thunk keys identically on both sides. A non-thunk without a Public
+///   symbol falls back to `name_orig` unchanged.
+fn function_join_key(mangled: Option<&str>, name_orig: &str) -> String {
+    if let Some(m) = mangled {
+        return m.to_string();
+    }
+    canonicalize_thunk_name_orig(name_orig).unwrap_or_else(|| name_orig.to_string())
+}
+
+/// Normalize a static-init/atexit thunk's `name_orig` to a side-independent
+/// `kind|fully-qualified-var` key (e.g. `dynamic initializer for|vostok::core::s_x`).
+/// Handles all three renderings the two PDBs produce for the same thunk:
+///
+/// * base mangled — `void ??__E…YAXXZ()`
+/// * target namespace-scope — `` void ns::`dynamic initializer for 'leaf''() ``
+/// * target class-scope — `` void `dynamic initializer for 'qualified::leaf''() ``
+///
+/// Returns `None` for anything that is not a `??__E`/`??__F` thunk.
+fn canonicalize_thunk_name_orig(name_orig: &str) -> Option<String> {
+    // `emit_function_orig` wraps the symbol as `void <sym>()`; strip that first.
+    let inner = name_orig.strip_prefix("void ")?.strip_suffix("()")?;
+
+    // Base side: reuse the shared mangled→demangled canonicalizer, then reduce its
+    // `` `dynamic initializer for 'FQ'' `` output to the `kind|FQ` key.
+    if let Some(demangled) = canonicalize_static_init_thunk(inner) {
+        return thunk_kind_var_key(&demangled);
+    }
+    // Target side: already demangled. Split off any `ns::` prefix that sits OUTSIDE
+    // the backtick form and fold it back into the fully-qualified variable.
+    let (prefix, tail) = match inner.find('`') {
+        Some(pos) => (&inner[..pos], &inner[pos..]),
+        None => ("", inner),
+    };
+    let (kind, var) = split_thunk_kind_var(tail)?;
+    Some(format!("{kind}|{prefix}{var}"))
+}
+
+/// From the demangled `` `dynamic initializer for 'FQ'' `` (no outer prefix),
+/// derive the `kind|FQ` key.
+fn thunk_kind_var_key(demangled: &str) -> Option<String> {
+    let (kind, var) = split_thunk_kind_var(demangled)?;
+    Some(format!("{kind}|{var}"))
+}
+
+/// Parse a `` `dynamic initializer for 'VAR'' `` / `` `dynamic atexit destructor
+/// for 'VAR'' `` token into `(kind, VAR)`.
+fn split_thunk_kind_var(s: &str) -> Option<(&'static str, &str)> {
+    for kind in ["dynamic initializer for", "dynamic atexit destructor for"] {
+        if let Some(rest) = s.strip_prefix(&format!("`{kind} '")) {
+            let var = rest.strip_suffix("''")?;
+            return Some((kind, var));
+        }
+    }
+    None
 }
 
 // ── Header reporting ────────────────────────────────────────────────────────
@@ -700,10 +811,11 @@ fn report_sources(base: &SideModel, target: &SideModel, cfg: &Config) {
 ///
 /// `extract_sources` collected, per side, the set of functions that have a
 /// standalone out-of-line body (a real code symbol / compiland definition with
-/// statements). Joining those two sets by `(engine-relative path, qualified
-/// signature)` — the same key the `[stmt]`/`[const]` per-function diffs use —
-/// a function present in exactly one side's set is an out-of-line presence
-/// divergence:
+/// statements). Joining those two sets by `(engine-relative path, join key)` —
+/// the same cross-PDB key the `[stmt]`/`[const]`/`[fn-order]` diffs use (the
+/// decorated COFF symbol, or the canonical thunk form; see
+/// [`function_join_key`]) — a function present in exactly one side's set is an
+/// out-of-line presence divergence:
 ///
 /// * **base-only**: we emit the function out-of-line but the target inlines it
 ///   (no standalone body there) — a noinline/forceinline decision.
@@ -717,14 +829,13 @@ fn report_sources(base: &SideModel, target: &SideModel, cfg: &Config) {
 /// are owned here and stripped from the source `[fn-order]` to avoid
 /// double-reporting. Returns `(base_only_count, target_only_count)`.
 ///
-/// Note: the join key is whatever `emit_function_orig` formats, so where that
-/// rendering differs between the two PDBs for the *same* logical function — e.g.
-/// the static-init/atexit thunks the base still renders mangled
-/// (`??__E…`) while the target renders demangled (`` `dynamic initializer
-/// for '…'' ``) — the function shows as paired one-sided entries (one base-only,
-/// one tgt-only). That is a pre-existing formatter-fidelity gap shared with the
-/// `[stmt]`/`[fn-order]` joins, not a real presence divergence; the genuine
-/// reconstruction targets are the non-thunk `tgt-only` entries.
+/// The join key is the decorated COFF symbol (identical across both PDBs), so a
+/// function the two PDBs merely DEMANGLE differently — template args rendered
+/// with vs without the `enum`/`class`/`struct` keyword, or the static-init
+/// thunks (`??__E…` mangled on base vs `` `dynamic initializer for '…'' ``
+/// demangled on target) — pairs cleanly and is no longer reported here. The
+/// surplus entries (genuine reconstruction targets) are still displayed with
+/// their readable demangled `name_orig`.
 fn report_presence_functions(base: &SideModel, target: &SideModel, cfg: &Config) -> (usize, usize) {
     let presence = presence_functions(base, target);
 
@@ -760,45 +871,49 @@ struct PresenceDiff {
 }
 
 /// Build the `(path, signature)` sets of functions present out-of-line on
-/// exactly one side. Multiple out-of-line bodies sharing a `(path, signature)`
-/// key (overloads collapsing under the same formatted signature) are paired
-/// positionally, so only a genuine count surplus on one side is reported.
+/// exactly one side. Functions are JOINED by their cross-PDB key (the decorated
+/// COFF symbol / canonical thunk form — see [`function_join_key`]), so the same
+/// logical function never shows up one-sided just because the two PDBs demangle
+/// its signature differently; the readable demangled `name_orig` is what gets
+/// reported for the surplus entries. Multiple out-of-line bodies sharing a key
+/// (overloads collapsing under the same mangled form) are paired positionally,
+/// so only a genuine count surplus on one side is reported.
 fn presence_functions(base: &SideModel, target: &SideModel) -> PresenceDiff {
     let mut base_only = Vec::new();
     let mut target_only = Vec::new();
 
     let paths = union_keys(base.files.keys(), target.files.keys());
     for path in paths {
-        let base_sigs = file_signatures(base.files.get(path));
-        let target_sigs = file_signatures(target.files.get(path));
+        let base_fns = file_functions(base.files.get(path));
+        let target_fns = file_functions(target.files.get(path));
 
         let mut target_counts: HashMap<&str, usize> = HashMap::new();
-        for sig in &target_sigs {
-            *target_counts.entry(sig.as_str()).or_default() += 1;
+        for (key, _) in &target_fns {
+            *target_counts.entry(key.as_str()).or_default() += 1;
         }
         let mut base_counts: HashMap<&str, usize> = HashMap::new();
-        for sig in &base_sigs {
-            *base_counts.entry(sig.as_str()).or_default() += 1;
+        for (key, _) in &base_fns {
+            *base_counts.entry(key.as_str()).or_default() += 1;
         }
 
         // base-only: a body on base with no remaining target counterpart.
         let mut consumed: HashMap<&str, usize> = HashMap::new();
-        for sig in &base_sigs {
-            let used = consumed.entry(sig.as_str()).or_default();
-            if *used < target_counts.get(sig.as_str()).copied().unwrap_or(0) {
+        for (key, display) in &base_fns {
+            let used = consumed.entry(key.as_str()).or_default();
+            if *used < target_counts.get(key.as_str()).copied().unwrap_or(0) {
                 *used += 1;
             } else {
-                base_only.push((path.clone(), sig.clone()));
+                base_only.push((path.clone(), display.clone()));
             }
         }
         // target-only: the mirror.
         let mut consumed: HashMap<&str, usize> = HashMap::new();
-        for sig in &target_sigs {
-            let used = consumed.entry(sig.as_str()).or_default();
-            if *used < base_counts.get(sig.as_str()).copied().unwrap_or(0) {
+        for (key, display) in &target_fns {
+            let used = consumed.entry(key.as_str()).or_default();
+            if *used < base_counts.get(key.as_str()).copied().unwrap_or(0) {
                 *used += 1;
             } else {
-                target_only.push((path.clone(), sig.clone()));
+                target_only.push((path.clone(), display.clone()));
             }
         }
     }
@@ -809,11 +924,12 @@ fn presence_functions(base: &SideModel, target: &SideModel) -> PresenceDiff {
     }
 }
 
-fn file_signatures(file: Option<&FileModel>) -> Vec<String> {
+/// `(join key, display signature)` for every function in a file, in order.
+fn file_functions(file: Option<&FileModel>) -> Vec<(String, String)> {
     file.map(|f| {
         f.functions
             .iter()
-            .map(|fun| fun.name_orig.clone())
+            .map(|fun| (fun.key.clone(), fun.name_orig.clone()))
             .collect()
     })
     .unwrap_or_default()
@@ -826,25 +942,35 @@ fn diff_file(path: &str, b: &FileModel, t: &FileModel, counts: &mut SourceCounts
     // out-of-line on BOTH sides (the `moved` set). Functions present out-of-line
     // on exactly one side are an out-of-line PRESENCE divergence, owned by the
     // global [presence] report (report_presence_functions) so we never
-    // double-report a one-sided body here.
-    let base_order: Vec<String> = b.functions.iter().map(|f| f.name_orig.clone()).collect();
-    let target_order: Vec<String> = t.functions.iter().map(|f| f.name_orig.clone()).collect();
+    // double-report a one-sided body here. Order is joined by the cross-PDB key
+    // (so a demangle-only difference never reads as a reorder); `moved` keys are
+    // mapped back to the readable `name_orig` for display.
+    let base_order: Vec<String> = b.functions.iter().map(|f| f.key.clone()).collect();
+    let target_order: Vec<String> = t.functions.iter().map(|f| f.key.clone()).collect();
     let order = seq_diff(&base_order, &target_order);
     if !order.moved.is_empty() {
         counts.order_diff += 1;
+        let display: HashMap<&str, &str> = b
+            .functions
+            .iter()
+            .map(|f| (f.key.as_str(), f.name_orig.as_str()))
+            .collect();
+        let moved: Vec<String> = order
+            .moved
+            .iter()
+            .map(|k| display.get(k.as_str()).copied().unwrap_or(k).to_string())
+            .collect();
         lines.push("  [fn-order]".to_string());
-        push_list(&mut lines, "    moved      ", &order.moved);
+        push_list(&mut lines, "    moved      ", &moved);
     }
 
-    // Per-function stmt/const comparison over functions present on both sides.
-    let target_by_name: HashMap<&str, &FnModel> = t
-        .functions
-        .iter()
-        .map(|f| (f.name_orig.as_str(), f))
-        .collect();
+    // Per-function stmt/const comparison over functions present on both sides,
+    // joined by the cross-PDB key.
+    let target_by_key: HashMap<&str, &FnModel> =
+        t.functions.iter().map(|f| (f.key.as_str(), f)).collect();
 
     for bf in &b.functions {
-        let Some(tf) = target_by_name.get(bf.name_orig.as_str()) else {
+        let Some(tf) = target_by_key.get(bf.key.as_str()) else {
             continue;
         };
 
@@ -1457,6 +1583,8 @@ mod tests {
         assert!(vis.is_empty());
     }
 
+    /// Build a side where each function's join key equals its displayed
+    /// signature (no demangle divergence) — the common case.
     fn side_with(files: &[(&str, &[&str])]) -> SideModel {
         let mut out = SideModel::default();
         for (path, sigs) in files {
@@ -1466,7 +1594,32 @@ mod tests {
                     functions: sigs
                         .iter()
                         .map(|sig| FnModel {
+                            key: sig.to_string(),
                             name_orig: sig.to_string(),
+                            statement_count: 0,
+                            constants: Vec::new(),
+                        })
+                        .collect(),
+                },
+            );
+        }
+        out
+    }
+
+    /// Build a side from explicit `(join key, displayed signature)` pairs, so a
+    /// test can model a function whose two PDBs render the signature differently
+    /// while the COFF key is shared.
+    fn side_with_keyed(files: &[(&str, &[(&str, &str)])]) -> SideModel {
+        let mut out = SideModel::default();
+        for (path, fns) in files {
+            out.files.insert(
+                path.to_string(),
+                FileModel {
+                    functions: fns
+                        .iter()
+                        .map(|(key, display)| FnModel {
+                            key: key.to_string(),
+                            name_orig: display.to_string(),
                             statement_count: 0,
                             constants: Vec::new(),
                         })
@@ -1543,6 +1696,106 @@ mod tests {
             vec![("m/u.cpp".to_string(), "void f()".to_string())]
         );
         assert!(diff.target_only.is_empty());
+    }
+
+    #[test]
+    fn join_key_prefers_mangled_symbol() {
+        // With a Public symbol, the key is that decorated name verbatim — it is
+        // identical across the two PDBs even when their demangled signatures differ.
+        let mangled = "?find_ignored_object@pre_perceptors_filter@ai@vostok@@ABE...@Z";
+        assert_eq!(
+            function_join_key(Some(mangled), "stlp_std::pair<...> vostok::ai::...()"),
+            mangled
+        );
+    }
+
+    #[test]
+    fn join_key_canonicalizes_static_init_thunk() {
+        // No Public symbol → every rendering of the same thunk normalizes to one
+        // `kind|fully-qualified-var` key, so the sides pair.
+        let key = "dynamic initializer for|s_flow_emulator";
+
+        // base mangled form.
+        assert_eq!(
+            function_join_key(None, "void ??__Es_flow_emulator@@YAXXZ()"),
+            key
+        );
+        // target class-scope form (FQ inside the backticks, no outer prefix).
+        assert_eq!(
+            function_join_key(None, "void `dynamic initializer for 's_flow_emulator''()"),
+            key
+        );
+    }
+
+    #[test]
+    fn join_key_unifies_namespace_and_class_thunk_renderings() {
+        // The SAME namespaced static `vostok::core::s_show_help` is rendered three
+        // ways across the two PDBs; all must collapse to one key.
+        let key = "dynamic initializer for|vostok::core::s_show_help";
+        // base mangled.
+        assert_eq!(
+            function_join_key(None, "void ??__Es_show_help@core@vostok@@YAXXZ()"),
+            key
+        );
+        // target namespace-scope: `ns::` prefix OUTSIDE the backticks, short inner.
+        assert_eq!(
+            function_join_key(
+                None,
+                "void vostok::core::`dynamic initializer for 's_show_help''()"
+            ),
+            key
+        );
+        // target class-scope-style: fully-qualified INSIDE the backticks.
+        assert_eq!(
+            function_join_key(
+                None,
+                "void `dynamic initializer for 'vostok::core::s_show_help''()"
+            ),
+            key
+        );
+    }
+
+    #[test]
+    fn join_key_atexit_destructor_distinct_from_initializer() {
+        // initializer and atexit destructor for the same var are different thunks.
+        let init = function_join_key(None, "void ??__Es_world@@YAXXZ()");
+        let dtor = function_join_key(None, "void ??__Fs_world@@YAXXZ()");
+        assert_eq!(init, "dynamic initializer for|s_world");
+        assert_eq!(dtor, "dynamic atexit destructor for|s_world");
+        assert_ne!(init, dtor);
+    }
+
+    #[test]
+    fn join_key_passes_through_plain_signature() {
+        // A non-thunk function without a Public symbol keeps its signature as key.
+        let sig = "void vostok::foo::bar(int)";
+        assert_eq!(function_join_key(None, sig), sig);
+    }
+
+    #[test]
+    fn presence_joins_by_key_despite_demangle_divergence() {
+        // The same logical function whose signature the two PDBs demangle
+        // differently (base drops the `enum` keyword inside a template arg, target
+        // keeps it) shares one COFF key. Joining on the key, it must NOT show up as
+        // a paired base-only / target-only presence false positive.
+        let mangled = "?ignore@pre_perceptors_filter@ai@vostok@@QAEX...@Z";
+        let base = side_with_keyed(&[(
+            "ai/pre_perceptors_filter.cpp",
+            &[(
+                mangled,
+                "void vostok::ai::...<...,vostok::ai::ignorance_types_enum>...()",
+            )],
+        )]);
+        let target = side_with_keyed(&[(
+            "ai/pre_perceptors_filter.cpp",
+            &[(
+                mangled,
+                "void vostok::ai::...<...,enum vostok::ai::ignorance_types_enum>...()",
+            )],
+        )]);
+        let diff = presence_functions(&base, &target);
+        assert!(diff.base_only.is_empty(), "{:?}", diff.base_only);
+        assert!(diff.target_only.is_empty(), "{:?}", diff.target_only);
     }
 
     #[test]
