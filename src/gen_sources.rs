@@ -120,6 +120,65 @@ pub fn dump_sources(
     Ok(cache)
 }
 
+/// Walk every compiland and hand each parsed [`Function`] to `visit`, without
+/// writing anything to disk. Functions arrive grouped by their recorded source
+/// file and, within a file, in ascending `proc_start` order (i.e. source-line
+/// definition order) — exactly what a cross-PDB order comparison needs.
+///
+/// This shares [`Module::build`] with [`dump_sources`] so the parsed model
+/// (statements, constants, locals, …) stays identical to what the generator
+/// emits. The borrowed `Function` only lives for the duration of each `visit`
+/// call; callers that need to keep data around should copy it out.
+pub fn for_each_function(
+    pdb: &mut pdb::PDB<std::fs::File>,
+    formatter: &PdbParser,
+    flags: GenFlags,
+    mut visit: impl FnMut(&str, &Function),
+) -> crate::Result<()> {
+    let address_map = pdb.address_map()?;
+    let string_table = pdb.string_table()?;
+
+    let dbi = pdb.debug_information()?;
+    let mut modules = dbi.modules()?;
+    let mut module_id: usize = usize::MAX;
+
+    while let Some(module) = modules.next()? {
+        module_id = module_id.wrapping_add(1);
+
+        let Some(module_info) = pdb.module_info(&module)? else {
+            continue;
+        };
+
+        // Same resilience as `dump_sources`: a compiland with unresolvable
+        // cross-module type references must not abort the whole walk.
+        let module = match Module::build(
+            &module_info,
+            module_id,
+            formatter,
+            &address_map,
+            &string_table,
+            flags,
+        ) {
+            Ok(module) => module,
+            Err(error) => {
+                eprintln!(
+                    "warning: skipping module {module_id} '{}': {error}",
+                    module.module_name(),
+                );
+                continue;
+            }
+        };
+
+        for (filename, funs) in &module.files {
+            for fun in funs.values() {
+                visit(filename, fun);
+            }
+        }
+    }
+
+    Ok(())
+}
+
 struct Module<'a> {
     files: BTreeMap<String, BTreeMap<u32, Function<'a>>>,
     // typedef void* ptr;
