@@ -55,6 +55,10 @@ pub struct Config {
     /// List the names of one-sided (base-only / target-only) headers and files
     /// instead of only counting them.
     pub list_presence: bool,
+    /// List the per-function out-of-line PRESENCE divergences (a function with a
+    /// standalone out-of-line body in exactly one side's compilands) instead of
+    /// only counting them. See [`report_presence_functions`].
+    pub list_presence_fns: bool,
 }
 
 // ── Owned comparison model ──────────────────────────────────────────────────
@@ -667,6 +671,8 @@ fn report_sources(base: &SideModel, target: &SideModel, cfg: &Config) {
 
     report_presence("files", &counts.only_base, &counts.only_target, cfg);
 
+    let presence = report_presence_functions(base, target, cfg);
+
     println!("---- source summary ----");
     println!(
         "files:  {both} compared, {div} diverged; base-only {ob}, target-only {ot}",
@@ -677,24 +683,156 @@ fn report_sources(base: &SideModel, target: &SideModel, cfg: &Config) {
     );
     println!(
         "        {order} files w/ fn-order diff, {stmt} functions w/ stmt-count diff, \
-         {cst} functions w/ const diff\n",
+         {cst} functions w/ const diff",
         order = counts.order_diff,
         stmt = counts.stmt_diff,
         cst = counts.const_diff,
     );
+    println!(
+        "        out-of-line presence: {pb} base-only (we emit standalone; target inlines), \
+         {pt} target-only (target emits standalone; we inline / no source)\n",
+        pb = presence.0,
+        pt = presence.1,
+    );
+}
+
+/// Per-function out-of-line PRESENCE divergence, across the whole source corpus.
+///
+/// `extract_sources` collected, per side, the set of functions that have a
+/// standalone out-of-line body (a real code symbol / compiland definition with
+/// statements). Joining those two sets by `(engine-relative path, qualified
+/// signature)` — the same key the `[stmt]`/`[const]` per-function diffs use —
+/// a function present in exactly one side's set is an out-of-line presence
+/// divergence:
+///
+/// * **base-only**: we emit the function out-of-line but the target inlines it
+///   (no standalone body there) — a noinline/forceinline decision.
+/// * **tgt-only**: the target emits the function out-of-line but our base
+///   inlines it / it is a `/* no source */` (inlined-only) function — a real
+///   reconstruction target: the target's standalone symbol gives us a body.
+///
+/// This is deliberately distinct from `[fn-order]`: that reports the relative
+/// definition ORDER of functions present on *both* sides within a matched file
+/// (mirroring the header `[fn-order]` decl-order check), so the one-sided lists
+/// are owned here and stripped from the source `[fn-order]` to avoid
+/// double-reporting. Returns `(base_only_count, target_only_count)`.
+///
+/// Note: the join key is whatever `emit_function_orig` formats, so where that
+/// rendering differs between the two PDBs for the *same* logical function — e.g.
+/// the static-init/atexit thunks the base still renders mangled
+/// (`??__E…`) while the target renders demangled (`` `dynamic initializer
+/// for '…'' ``) — the function shows as paired one-sided entries (one base-only,
+/// one tgt-only). That is a pre-existing formatter-fidelity gap shared with the
+/// `[stmt]`/`[fn-order]` joins, not a real presence divergence; the genuine
+/// reconstruction targets are the non-thunk `tgt-only` entries.
+fn report_presence_functions(base: &SideModel, target: &SideModel, cfg: &Config) -> (usize, usize) {
+    let presence = presence_functions(base, target);
+
+    if cfg.list_presence_fns && (!presence.base_only.is_empty() || !presence.target_only.is_empty())
+    {
+        if !presence.base_only.is_empty() {
+            println!(
+                "---- base-only out-of-line functions ({}) ----",
+                presence.base_only.len()
+            );
+            for (path, sig) in &presence.base_only {
+                println!("  [presence] base-only  {path}  {sig}");
+            }
+        }
+        if !presence.target_only.is_empty() {
+            println!(
+                "---- target-only out-of-line functions ({}) ----",
+                presence.target_only.len()
+            );
+            for (path, sig) in &presence.target_only {
+                println!("  [presence] tgt-only   {path}  {sig}");
+            }
+        }
+        println!();
+    }
+
+    (presence.base_only.len(), presence.target_only.len())
+}
+
+struct PresenceDiff {
+    base_only: Vec<(String, String)>,
+    target_only: Vec<(String, String)>,
+}
+
+/// Build the `(path, signature)` sets of functions present out-of-line on
+/// exactly one side. Multiple out-of-line bodies sharing a `(path, signature)`
+/// key (overloads collapsing under the same formatted signature) are paired
+/// positionally, so only a genuine count surplus on one side is reported.
+fn presence_functions(base: &SideModel, target: &SideModel) -> PresenceDiff {
+    let mut base_only = Vec::new();
+    let mut target_only = Vec::new();
+
+    let paths = union_keys(base.files.keys(), target.files.keys());
+    for path in paths {
+        let base_sigs = file_signatures(base.files.get(path));
+        let target_sigs = file_signatures(target.files.get(path));
+
+        let mut target_counts: HashMap<&str, usize> = HashMap::new();
+        for sig in &target_sigs {
+            *target_counts.entry(sig.as_str()).or_default() += 1;
+        }
+        let mut base_counts: HashMap<&str, usize> = HashMap::new();
+        for sig in &base_sigs {
+            *base_counts.entry(sig.as_str()).or_default() += 1;
+        }
+
+        // base-only: a body on base with no remaining target counterpart.
+        let mut consumed: HashMap<&str, usize> = HashMap::new();
+        for sig in &base_sigs {
+            let used = consumed.entry(sig.as_str()).or_default();
+            if *used < target_counts.get(sig.as_str()).copied().unwrap_or(0) {
+                *used += 1;
+            } else {
+                base_only.push((path.clone(), sig.clone()));
+            }
+        }
+        // target-only: the mirror.
+        let mut consumed: HashMap<&str, usize> = HashMap::new();
+        for sig in &target_sigs {
+            let used = consumed.entry(sig.as_str()).or_default();
+            if *used < base_counts.get(sig.as_str()).copied().unwrap_or(0) {
+                *used += 1;
+            } else {
+                target_only.push((path.clone(), sig.clone()));
+            }
+        }
+    }
+
+    PresenceDiff {
+        base_only,
+        target_only,
+    }
+}
+
+fn file_signatures(file: Option<&FileModel>) -> Vec<String> {
+    file.map(|f| {
+        f.functions
+            .iter()
+            .map(|fun| fun.name_orig.clone())
+            .collect()
+    })
+    .unwrap_or_default()
 }
 
 fn diff_file(path: &str, b: &FileModel, t: &FileModel, counts: &mut SourceCounts) -> bool {
     let mut lines: Vec<String> = Vec::new();
 
+    // [fn-order] reports only the relative DEFINITION ORDER of functions present
+    // out-of-line on BOTH sides (the `moved` set). Functions present out-of-line
+    // on exactly one side are an out-of-line PRESENCE divergence, owned by the
+    // global [presence] report (report_presence_functions) so we never
+    // double-report a one-sided body here.
     let base_order: Vec<String> = b.functions.iter().map(|f| f.name_orig.clone()).collect();
     let target_order: Vec<String> = t.functions.iter().map(|f| f.name_orig.clone()).collect();
     let order = seq_diff(&base_order, &target_order);
-    if order.diverged() {
+    if !order.moved.is_empty() {
         counts.order_diff += 1;
         lines.push("  [fn-order]".to_string());
-        push_list(&mut lines, "    only-base  ", &order.only_base);
-        push_list(&mut lines, "    only-tgt   ", &order.only_target);
         push_list(&mut lines, "    moved      ", &order.moved);
     }
 
@@ -1317,6 +1455,94 @@ mod tests {
         assert!(fields.diverged());
         let vis = diff_visibility(&b, &t, &fields, &empty_seq());
         assert!(vis.is_empty());
+    }
+
+    fn side_with(files: &[(&str, &[&str])]) -> SideModel {
+        let mut out = SideModel::default();
+        for (path, sigs) in files {
+            out.files.insert(
+                path.to_string(),
+                FileModel {
+                    functions: sigs
+                        .iter()
+                        .map(|sig| FnModel {
+                            name_orig: sig.to_string(),
+                            statement_count: 0,
+                            constants: Vec::new(),
+                        })
+                        .collect(),
+                },
+            );
+        }
+        out
+    }
+
+    #[test]
+    fn presence_self_compare_is_clean() {
+        // Identical source-function sets on both sides → zero presence diffs.
+        // This is the binary's `self-compare MUST report 0 [presence]` invariant.
+        let side = side_with(&[
+            ("a/x.cpp", &["void a::f()", "int a::g()"]),
+            ("b/y.cpp", &["void b::h()"]),
+        ]);
+        let other = side_with(&[
+            ("a/x.cpp", &["void a::f()", "int a::g()"]),
+            ("b/y.cpp", &["void b::h()"]),
+        ]);
+        let diff = presence_functions(&side, &other);
+        assert!(diff.base_only.is_empty());
+        assert!(diff.target_only.is_empty());
+    }
+
+    #[test]
+    fn presence_flags_one_sided_out_of_line_bodies() {
+        // base emits f() and g() out-of-line; target emits f() and h(). So:
+        //   g() is base-only  (we emit standalone, target inlines it)
+        //   h() is tgt-only   (target emits standalone, we inline it / no source)
+        // f() is on both sides → NOT a presence diff (it is the [fn-order] domain).
+        let base = side_with(&[("m/u.cpp", &["void f()", "int g()"])]);
+        let target = side_with(&[("m/u.cpp", &["void f()", "void h()"])]);
+        let diff = presence_functions(&base, &target);
+        assert_eq!(
+            diff.base_only,
+            vec![("m/u.cpp".to_string(), "int g()".to_string())]
+        );
+        assert_eq!(
+            diff.target_only,
+            vec![("m/u.cpp".to_string(), "void h()".to_string())]
+        );
+    }
+
+    #[test]
+    fn presence_covers_one_sided_files() {
+        // A whole file present out-of-line on only one side: every function in it
+        // is a presence diff for that side (the file-level presence list reports
+        // the file; this reports its bodies as reconstruction targets).
+        let base = side_with(&[("only/base.cpp", &["void only_base()"])]);
+        let target = side_with(&[("only/tgt.cpp", &["void only_tgt()"])]);
+        let diff = presence_functions(&base, &target);
+        assert_eq!(
+            diff.base_only,
+            vec![("only/base.cpp".to_string(), "void only_base()".to_string())]
+        );
+        assert_eq!(
+            diff.target_only,
+            vec![("only/tgt.cpp".to_string(), "void only_tgt()".to_string())]
+        );
+    }
+
+    #[test]
+    fn presence_pairs_duplicate_signatures_positionally() {
+        // Two out-of-line bodies share a formatted signature on base, one on
+        // target → exactly one surplus base-only body, none target-only.
+        let base = side_with(&[("m/u.cpp", &["void f()", "void f()"])]);
+        let target = side_with(&[("m/u.cpp", &["void f()"])]);
+        let diff = presence_functions(&base, &target);
+        assert_eq!(
+            diff.base_only,
+            vec![("m/u.cpp".to_string(), "void f()".to_string())]
+        );
+        assert!(diff.target_only.is_empty());
     }
 
     #[test]

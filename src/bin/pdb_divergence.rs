@@ -56,6 +56,13 @@ struct Cli {
     #[arg(long)]
     list_presence: bool,
 
+    /// Print the per-function out-of-line PRESENCE divergences — functions with
+    /// a standalone out-of-line body in exactly one PDB (`base-only`: we emit it
+    /// standalone, target inlines it; `tgt-only`: target emits it standalone, we
+    /// inline it / it is `/* no source */`) — not just their counts.
+    #[arg(long)]
+    list_presence_fns: bool,
+
     #[command(flatten)]
     scope: Scope,
 }
@@ -89,6 +96,7 @@ fn main() {
         do_headers: !cli.scope.sources_only,
         do_sources: !cli.scope.headers_only,
         list_presence: cli.list_presence,
+        list_presence_fns: cli.list_presence_fns,
     };
 
     let base_engine = normalize_prefix(&cli.base_engine_path);
