@@ -36,8 +36,16 @@ struct Cli {
     exe: PathBuf,
 
     /// Recorded source-path prefix to strip (identifies engine files).
-    #[arg(long, default_value = r"c:\survarium\sources")]
-    engine_path: String,
+    ///
+    /// REPEATABLE. A build draws compilands from more than one tree: the
+    /// engine's own sources, and the Scaleform GFx SDK, which sits outside it
+    /// (retail records it under C:\w\<hash>\Scaleform\Releases\GFx_4.2.21\,
+    /// ours under the local SDK checkout). A single prefix silently dropped the
+    /// other tree's compilands on BOTH sides, so those functions produced no
+    /// records at all. Prefixes are tried in order, first match wins; give each
+    /// tree the prefix that leaves the SAME relative path on both sides.
+    #[arg(long, default_values_t = [String::from(r"c:\survarium\sources")])]
+    engine_path: Vec<String>,
 
     /// Local engine source root to read statement text from (base mode).
     #[arg(long, value_hint = clap::ValueHint::DirPath)]
@@ -54,13 +62,20 @@ struct Cli {
 fn main() {
     let cli = Cli::parse();
 
-    let mut engine_path = cli.engine_path.to_lowercase().replace('/', "\\");
-    if !engine_path.ends_with('\\') {
-        engine_path.push('\\');
-    }
+    let engine_paths: Vec<String> = cli
+        .engine_path
+        .iter()
+        .map(|path| {
+            let mut path = path.to_lowercase().replace('/', "\\");
+            if !path.ends_with('\\') {
+                path.push('\\');
+            }
+            path
+        })
+        .collect();
 
     let opts = Options {
-        engine_path,
+        engine_paths,
         source_root: cli.source_root,
         target_mode: matches!(cli.mode, Mode::Target),
         out_dir: cli.out,

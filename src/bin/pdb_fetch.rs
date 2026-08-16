@@ -78,7 +78,7 @@ struct Cli {
     #[arg(long, value_parser = parse_hex)]
     offset: Option<u32>,
 
-    /// Absolute VA (hex) - the `address` column; the statement whose byte range
+    /// Absolute VA (hex) - the `va` column; the statement whose byte range
     /// contains it is shown.
     #[arg(long, value_parser = parse_hex)]
     address: Option<u32>,

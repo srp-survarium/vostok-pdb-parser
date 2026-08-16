@@ -173,7 +173,7 @@ pub struct Options {
     /// Recorded source-path prefix to strip (lowercased, `\`-separated, trailing
     /// `\`), e.g. `c:\survarium\sources\`. Used to identify engine files and to
     /// build relative paths for the output tree.
-    pub engine_path: String,
+    pub engine_paths: Vec<String>,
     /// Local directory the engine sources actually live in (base mode). When set,
     /// statement text is read from `source_root / <relative path>`; on a miss the
     /// statement keeps `source: None`.
@@ -288,7 +288,12 @@ pub fn dump_rich_context(pdb_path: &Path, exe_path: &Path, opts: &Options) -> cr
 
                             let file_name = file_name.unwrap_or_default();
                             let lower = file_name.to_lowercase().replace('/', "\\");
-                            let rel = lower.strip_prefix(&opts.engine_path).map(|s| s.to_string());
+                            // first prefix that matches wins - see Cli::engine_path
+                            let rel = opts
+                                .engine_paths
+                                .iter()
+                                .find_map(|prefix| lower.strip_prefix(prefix.as_str()))
+                                .map(|s| s.to_string());
 
                             // Tree output only carries engine files; stdout all.
                             if opts.out_dir.is_some() && rel.is_none() {
