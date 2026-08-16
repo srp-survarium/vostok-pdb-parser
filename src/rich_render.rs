@@ -70,7 +70,7 @@ pub fn render_listing_statement(f: &FunctionEntry, n: usize) -> String {
     let stmt = &f.statements[n];
     let (lo, hi) = (stmt.off, stmt.off + stmt.size);
     let va = f.image_base.wrapping_add(f.rva).wrapping_add(lo);
-    let _ = writeln!(out, "; 0x{:x} stmt #{} line {}", va, n, stmt.line);
+    let _ = writeln!(out, "; va=0x{:x} stmt #{} line {}", va, n, stmt.line);
     let _ = writeln!(out, "{}", f.name);
     // The statement heads its instructions on its own line `[0xNN]:`, like the
     // full listing; the source text follows on base.
@@ -114,7 +114,7 @@ pub fn render_structure(f: &FunctionEntry) -> String {
     // every form to an empty body: header line only, zero statement rows.
     let func_va = f.image_base.wrapping_add(f.rva);
     if f.is_body_less() {
-        let _ = writeln!(out, "; 0x{:x}, 0 statements, 0x{:x} bytes", func_va, f.size);
+        let _ = writeln!(out, "; va=0x{:x} rva=0x{:x}, 0 statements, 0x{:x} bytes", func_va, f.rva, f.size);
         let _ = writeln!(out, "{}", f.name);
         let _ = writeln!(out, "{{");
         render_locals_into(&mut out, f);
@@ -131,8 +131,9 @@ pub fn render_structure(f: &FunctionEntry) -> String {
     // Stats on their own comment line so the signature line stays short.
     let _ = writeln!(
         out,
-        "; 0x{:x}, {} statements, 0x{:x} bytes",
+        "; va=0x{:x} rva=0x{:x}, {} statements, 0x{:x} bytes",
         func_va,
+        f.rva,
         n - 2,
         f.size
     );
@@ -177,7 +178,7 @@ pub fn render_structure(f: &FunctionEntry) -> String {
             .unwrap_or(1)
             .max(min)
     };
-    let da = hexw(&mut rows.iter().map(|r| r.va as u64), "address".len() - 2);
+    let da = hexw(&mut rows.iter().map(|r| r.va as u64), "va".len());
     let dofs = hexw(&mut rows.iter().map(|r| r.off as u64), "offst".len() - 2);
     let dd = hexw(
         &mut rows.iter().map(|r| r.delta.unsigned_abs()),
@@ -228,7 +229,7 @@ pub fn render_structure(f: &FunctionEntry) -> String {
     let has_code = rows.iter().any(|r| r.src.is_some());
 
     // Header + separator, assembled from the present columns so they always align.
-    let mut header = format!("{:<wa$}|{:<wo$}|{:^ws$}", "address", "offst", "size");
+    let mut header = format!("{:<wa$}|{:<wo$}|{:^ws$}", "va", "offst", "size");
     let mut sep = format!("{}+{}+{}", "-".repeat(wa), "-".repeat(wo), "-".repeat(ws));
     if has_scope {
         header += &format!("|{:^wsc$}", "scope");

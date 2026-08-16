@@ -443,15 +443,17 @@ pub fn render_structure_diff(base: &FunctionEntry, target: &FunctionEntry) -> St
         .count();
     let _ = writeln!(
         out,
-        "; target 0x{:x}  {} stmts  0x{:x} bytes",
+        "; target va=0x{:x} rva=0x{:x}  {} stmts  0x{:x} bytes",
         va(target, 0),
+        target.rva,
         tstmts,
         target.size
     );
     let _ = writeln!(
         out,
-        "; base   0x{:x}  {} stmts  0x{:x} bytes",
+        "; base   va=0x{:x} rva=0x{:x}  {} stmts  0x{:x} bytes",
         va(base, 0),
+        base.rva,
         bstmts,
         base.size
     );
@@ -484,13 +486,13 @@ pub fn render_structure_diff(base: &FunctionEntry, target: &FunctionEntry) -> St
             .map(|d| addr(d.taddr).len())
             .max()
             .unwrap_or(0)
-            .max("t.addr".len());
+            .max("t.va".len());
         let wba = ds
             .iter()
             .map(|d| addr(d.baddr).len())
             .max()
             .unwrap_or(0)
-            .max("b.addr".len());
+            .max("b.va".len());
         let wt = ds
             .iter()
             .map(|d| sz(d.tsize).len())
@@ -557,7 +559,7 @@ pub fn render_structure_diff(base: &FunctionEntry, target: &FunctionEntry) -> St
         let _ = writeln!(
             out,
             "{:<wd$}|{:<wta$}|{:<wba$}|{:<wt$}|{:<wb$}|{:<wtl$}|{:<wbl$}|b.code",
-            "b.diff", "t.addr", "b.addr", "t.sz", "b.sz", "t.ln", "b.ln"
+            "b.diff", "t.va", "b.va", "t.sz", "b.sz", "t.ln", "b.ln"
         );
         let _ = writeln!(
             out,
