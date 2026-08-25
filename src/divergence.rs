@@ -185,7 +185,7 @@ fn extract_headers(
     while let Some(item) = type_iter.next()? {
         match item.parse() {
             Ok(TypeData::Class(data)) if !data.properties.forward_reference() => {
-                let qualified_name = data.name.to_string().to_string();
+                let qualified_name = canon_display(&data.name.to_string());
                 if !include_type(&qualified_name, cfg) {
                     continue;
                 }
@@ -210,7 +210,7 @@ fn extract_headers(
             Ok(TypeData::Union(data))
                 if !data.properties.forward_reference() && !data.properties.is_nested_type() =>
             {
-                let qualified_name = data.name.to_string().to_string();
+                let qualified_name = canon_display(&data.name.to_string());
                 if !include_type(&qualified_name, cfg) {
                     continue;
                 }
@@ -235,7 +235,7 @@ fn extract_headers(
             Ok(TypeData::Enumeration(data))
                 if !data.properties.forward_reference() && !data.properties.is_nested_type() =>
             {
-                let qualified_name = data.name.to_string().to_string();
+                let qualified_name = canon_display(&data.name.to_string());
                 if !include_type(&qualified_name, cfg) {
                     continue;
                 }
@@ -1398,6 +1398,7 @@ fn skipped(name: &str, cfg: &Config) -> bool {
 /// shape (bitfield length/position, surrounding type) is preserved and still
 /// compared.
 fn clean_type(s: String) -> String {
+    let s = canon_display(&s);
     if !s.contains("TypeIndex(") {
         return s;
     }
@@ -1417,6 +1418,41 @@ fn clean_type(s: String) -> String {
         }
     }
     out.push_str(rest);
+    out
+}
+
+/// Display-name canonicalization for the undname-vs-frontend split. Retail's
+/// PDB stores UDT record names in the demangler's rendering (elaborated
+/// `enum`/`struct`/`class` keywords inside template args, a stray space after
+/// suffix `const` before `,`/`>`/`)`), while a fresh compile stores the
+/// frontend's rendering of the SAME type. The sources side already dodges this
+/// by joining on mangled symbols; here the record names themselves (and every
+/// member type / method signature rendered through them) get normalized so
+/// only real drifts survive the comparison. Word-boundary checked: an
+/// identifier merely ending in `..._enum` is left alone.
+fn canon_display(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out = String::with_capacity(s.len());
+    let mut i = 0;
+    while i < b.len() {
+        let at_boundary = i == 0 || !(b[i - 1].is_ascii_alphanumeric() || b[i - 1] == b'_');
+        if at_boundary {
+            let rest = &s[i..];
+            if let Some(kw) = ["enum ", "struct ", "class ", "union "]
+                .iter()
+                .find(|kw| rest.starts_with(**kw))
+            {
+                i += kw.len();
+                continue;
+            }
+        }
+        if b[i] == b' ' && i + 1 < b.len() && matches!(b[i + 1], b',' | b'>' | b')') {
+            i += 1;
+            continue;
+        }
+        out.push(b[i] as char);
+        i += 1;
+    }
     out
 }
 
@@ -1813,5 +1849,38 @@ mod tests {
         assert!(a.contains("length: 4"));
         // A plain type is returned untouched.
         assert_eq!(clean_type("s32".to_string()), "s32");
+    }
+
+    #[test]
+    fn canon_display_normalizes_undname_style() {
+        // Retail (undname) vs fresh-compile (frontend) spellings of one type.
+        assert_eq!(
+            canon_display("flags_type< enum vostok::resources::cook_base::flags_enum, policy >"),
+            canon_display("flags_type< vostok::resources::cook_base::flags_enum, policy >"),
+        );
+        assert_eq!(
+            canon_display("boost::function< void( enum result_enum ) >"),
+            canon_display("boost::function< void( result_enum ) >"),
+        );
+        // suffix-const stray space before a separator collapses
+        assert_eq!(
+            canon_display("pair< unsigned int const , oracle* >"),
+            canon_display("pair< unsigned int const, oracle* >"),
+        );
+        assert_eq!(
+            canon_display("helper< char const , 1 >"),
+            canon_display("helper< char const, 1 >"),
+        );
+        // an identifier merely ENDING in `..._enum ` keeps its name
+        // (the trailing space-before-`)` still collapses)
+        assert_eq!(
+            canon_display("f( codes_enum value )"),
+            "f( codes_enum value)".to_string(),
+        );
+        // struct/class elaborations normalize the same way
+        assert_eq!(
+            canon_display("vtable< bool, char const*, struct survarium::hit >"),
+            canon_display("vtable< bool, char const*, survarium::hit >"),
+        );
     }
 }
