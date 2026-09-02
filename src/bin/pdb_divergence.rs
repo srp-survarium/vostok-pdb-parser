@@ -4,9 +4,10 @@
 //! game) — and prints where their headers and sources diverge:
 //!
 //! * headers: class/struct/union/enum size, member layout, member-function order
-//! * sources: function definition order, per-function statement count, and
-//!   per-function constants (matched by value+type, so renames surface as
-//!   misnames)
+//! * sources: function definition order and per-function constants (matched by
+//!   value+type, so renames surface as misnames). Raw CodeView line-table entry
+//!   counts are available only through `--raw-line-table-counts`; they are not
+//!   semantic statement counts.
 //!
 //! `--skip <pat>` (repeatable) drops any header (by qualified name) or source
 //! (by engine-relative path) whose name contains the case-insensitive substring,
@@ -63,6 +64,12 @@ struct Cli {
     #[arg(long)]
     list_presence_fns: bool,
 
+    /// Also report raw per-function CodeView line-table entry-count differences.
+    /// These counts reflect optimization attribution and source-line packing,
+    /// not semantic statement structure, so they are excluded by default.
+    #[arg(long)]
+    raw_line_table_counts: bool,
+
     #[command(flatten)]
     scope: Scope,
 }
@@ -97,6 +104,7 @@ fn main() {
         do_sources: !cli.scope.headers_only,
         list_presence: cli.list_presence,
         list_presence_fns: cli.list_presence_fns,
+        compare_raw_line_table_counts: cli.raw_line_table_counts,
     };
 
     let base_engine = normalize_prefix(&cli.base_engine_path);
