@@ -387,8 +387,12 @@ struct OrderItem {
 #[derive(Default)]
 struct OrderSide {
     layout: Option<MsfLayout>,
+    msf_free_pages: Vec<OrderItem>,
     stream_roles: Vec<StreamRoleBinding>,
     dbi_substreams: Vec<OrderItem>,
+    dbi_ec_names: Vec<OrderItem>,
+    dbi_ec_metadata: Vec<OrderItem>,
+    dbi_ec_hash_buckets: Vec<OrderItem>,
     named_streams: Vec<OrderItem>,
     named_stream_buckets: Vec<OrderItem>,
     deleted_named_stream_buckets: Vec<OrderItem>,
@@ -428,6 +432,12 @@ struct OrderSide {
     module_files: Vec<ModuleOrderScope>,
     module_lines: Vec<ModuleOrderScope>,
     module_subsections: Vec<ModuleOrderScope>,
+    module_strings: Vec<ModuleOrderScope>,
+    module_frame_data: Vec<ModuleOrderScope>,
+    module_inlinees: Vec<ModuleOrderScope>,
+    module_cross_imports: Vec<ModuleOrderScope>,
+    module_cross_exports: Vec<ModuleOrderScope>,
+    module_other_c13: Vec<ModuleOrderScope>,
     dbi_source_files: Vec<ModuleOrderScope>,
 }
 
@@ -451,9 +461,13 @@ struct OrderReport {
     base_pdb: String,
     coverage: Vec<OrderCoverage>,
     msf_layout: MsfLayoutComparison,
+    msf_free_pages: SequenceComparison,
     stream_roles: SequenceComparison,
     dbi_substreams: SequenceComparison,
     dbi_source_file_streams: ScopedStreamReport,
+    dbi_ec_names: SequenceComparison,
+    dbi_ec_metadata: SequenceComparison,
+    dbi_ec_hash_buckets: SequenceComparison,
     named_streams: SequenceComparison,
     named_stream_buckets: SequenceComparison,
     deleted_named_stream_buckets: SequenceComparison,
@@ -500,6 +514,12 @@ struct OrderReport {
     module_file_streams: ScopedStreamReport,
     module_line_streams: ScopedStreamReport,
     module_subsection_streams: ScopedStreamReport,
+    module_string_streams: ScopedStreamReport,
+    module_frame_data_streams: ScopedStreamReport,
+    module_inlinee_streams: ScopedStreamReport,
+    module_cross_import_streams: ScopedStreamReport,
+    module_cross_export_streams: ScopedStreamReport,
+    module_other_c13_streams: ScopedStreamReport,
 }
 
 #[derive(serde::Serialize)]
@@ -534,6 +554,8 @@ struct MsfLayoutSummary {
     format: String,
     page_size: u32,
     free_page_map: u32,
+    free_page_map_pages: Vec<u32>,
+    free_pages: usize,
     pages_used: u32,
     file_bytes: u64,
     directory_size: u32,
@@ -665,6 +687,12 @@ fn build_order_report(
     let target = load_order_side(target_pdb)?;
     let base = load_order_side(base_pdb)?;
     let msf_layout = compare_msf_layouts(base_pdb, &base, target_pdb, &target)?;
+    let msf_free_pages = compare_sequence(
+        "MSF active free-page-map sequence",
+        "exact physical allocation state",
+        &base.msf_free_pages,
+        &target.msf_free_pages,
+    );
     let base_stream_roles = ordered_stream_roles(&base);
     let target_stream_roles = ordered_stream_roles(&target);
     let stream_roles = compare_sequence(
@@ -684,6 +712,24 @@ fn build_order_report(
         "physical/linker-derived",
         &base.dbi_source_files,
         &target.dbi_source_files,
+    );
+    let dbi_ec_names = compare_sequence(
+        "DBI edit-and-continue string-table sequence",
+        "compiler/linker-emitted string serialization",
+        &base.dbi_ec_names,
+        &target.dbi_ec_names,
+    );
+    let dbi_ec_metadata = compare_sequence(
+        "DBI edit-and-continue string-table metadata",
+        "physical/toolchain-derived",
+        &base.dbi_ec_metadata,
+        &target.dbi_ec_metadata,
+    );
+    let dbi_ec_hash_buckets = compare_sequence(
+        "DBI edit-and-continue hash-bucket sequence",
+        "physical/hash-derived",
+        &base.dbi_ec_hash_buckets,
+        &target.dbi_ec_hash_buckets,
     );
     let named_streams = compare_sequence(
         "PDB named-stream map",
@@ -1005,15 +1051,55 @@ fn build_order_report(
         &base.module_subsections,
         &target.module_subsections,
     );
+    let module_string_streams = compare_scoped_streams(
+        "module C13 string-table sequence",
+        "compiler-emitted/module-local",
+        &base.module_strings,
+        &target.module_strings,
+    );
+    let module_frame_data_streams = compare_scoped_streams(
+        "module C13 frame-data sequence",
+        "compiler/linker/address-derived",
+        &base.module_frame_data,
+        &target.module_frame_data,
+    );
+    let module_inlinee_streams = compare_scoped_streams(
+        "module C13 inlinee-source-line sequence",
+        "compiler-emitted/id-index-derived",
+        &base.module_inlinees,
+        &target.module_inlinees,
+    );
+    let module_cross_import_streams = compare_scoped_streams(
+        "module C13 cross-scope import sequence",
+        "compiler-emitted/module-reference-derived",
+        &base.module_cross_imports,
+        &target.module_cross_imports,
+    );
+    let module_cross_export_streams = compare_scoped_streams(
+        "module C13 cross-scope export sequence",
+        "compiler/linker/type-index-derived",
+        &base.module_cross_exports,
+        &target.module_cross_exports,
+    );
+    let module_other_c13_streams = compare_scoped_streams(
+        "module other C13 payload word sequence",
+        "physical/ordinal; used only for subsection kinds without a stable decoder",
+        &base.module_other_c13,
+        &target.module_other_c13,
+    );
 
     Ok(OrderReport {
         target_pdb: target_pdb.display().to_string(),
         base_pdb: base_pdb.display().to_string(),
         coverage: order_coverage(),
         msf_layout,
+        msf_free_pages,
         stream_roles,
         dbi_substreams,
         dbi_source_file_streams,
+        dbi_ec_names,
+        dbi_ec_metadata,
+        dbi_ec_hash_buckets,
         named_streams,
         named_stream_buckets,
         deleted_named_stream_buckets,
@@ -1060,6 +1146,12 @@ fn build_order_report(
         module_file_streams,
         module_line_streams,
         module_subsection_streams,
+        module_string_streams,
+        module_frame_data_streams,
+        module_inlinee_streams,
+        module_cross_import_streams,
+        module_cross_export_streams,
+        module_other_c13_streams,
     })
 }
 
@@ -1072,8 +1164,8 @@ fn order_coverage() -> Vec<OrderCoverage> {
         },
         OrderCoverage {
             channel: "MSF free-page-map bitmap",
-            status: "inventory only",
-            note: "the active map page is identified; individual free/used bits are not compared yet",
+            status: "exact physical allocation sequence",
+            note: "every active FPM block and every free page bit within the declared file are compared",
         },
         OrderCoverage {
             channel: "PDB information and named-stream map",
@@ -1107,8 +1199,8 @@ fn order_coverage() -> Vec<OrderCoverage> {
         },
         OrderCoverage {
             channel: "DBI source-info, type-server-map and EC payloads",
-            status: "source-info semantic; other payloads layout only",
-            note: "per-module source-file references are ordered; type-server and EC inner tables are not decoded yet",
+            status: "source-info and EC semantic/hash; type-server absent",
+            note: "per-module source-file references and the EC string/hash table are ordered; the type-server map is empty in both PDBs",
         },
         OrderCoverage {
             channel: "global symbol record stream",
@@ -1126,14 +1218,9 @@ fn order_coverage() -> Vec<OrderCoverage> {
             note: "all serialized records plus recognized top-level symbols are compared per stable module scope",
         },
         OrderCoverage {
-            channel: "module C13 subsections, checksums and line records",
+            channel: "module C13 subsections and inner records",
             status: "raw/semantic sequence",
-            note: "serialized subsection, checksum and line order is decoded without inferred cross-subsection lengths",
-        },
-        OrderCoverage {
-            channel: "C13 inlinee, frame-data and cross-scope inner records",
-            status: "subsection layout only",
-            note: "subsection order/size is compared; inner record streams are not decoded yet",
+            note: "subsections, local strings, checksums, lines, frame data, inlinees, cross-scope maps and raw words for unknown payload kinds are compared in serialized order",
         },
         OrderCoverage {
             channel: "optional DBI debug streams (FPO, OMAP, fixup, frame data, xdata/pdata)",
@@ -1151,6 +1238,15 @@ fn order_coverage() -> Vec<OrderCoverage> {
 fn load_order_side(pdb_path: &PathBuf) -> vostok_pdb_parser::Result<OrderSide> {
     let mut side = OrderSide::default();
     let layout = MsfLayout::parse(pdb_path)?;
+    side.msf_free_pages = layout
+        .free_pages
+        .iter()
+        .map(|page| OrderItem {
+            key: format!("page={page}"),
+            value: format!("free page={page}"),
+            comparison_value: "free".to_owned(),
+        })
+        .collect();
     let pdb_info = load_raw_pdb_info(pdb_path, &layout)?;
     side.named_stream_buckets = pdb_info.named_buckets;
     side.deleted_named_stream_buckets = pdb_info.deleted_buckets;
@@ -1175,11 +1271,10 @@ fn load_order_side(pdb_path: &PathBuf) -> vostok_pdb_parser::Result<OrderSide> {
     let raw_dbi = load_raw_dbi_inventory(pdb_path, &layout)?;
     side.dbi_substreams = raw_dbi.substreams.clone();
     side.dbi_source_files = raw_dbi.source_files.clone();
+    side.dbi_ec_names = raw_dbi.ec_names.clone();
+    side.dbi_ec_metadata = raw_dbi.ec_metadata.clone();
+    side.dbi_ec_hash_buckets = raw_dbi.ec_hash_buckets.clone();
     append_raw_dbi_stream_roles(&mut side.stream_roles, &raw_dbi);
-    let raw_module_debug = load_module_debug_scopes(pdb_path, &layout, &raw_dbi)?;
-    side.module_subsections = raw_module_debug.subsections;
-    side.module_files = raw_module_debug.files;
-    side.module_lines = raw_module_debug.lines;
     side.layout = Some(layout);
     let mut global_symbol_by_offset = HashMap::new();
     let mut type_by_index = HashMap::new();
@@ -1497,6 +1592,23 @@ fn load_order_side(pdb_path: &PathBuf) -> vostok_pdb_parser::Result<OrderSide> {
     side.legacy_fpo_records = load_legacy_fpo_records(pdb_path, layout, &raw_dbi.debug_streams)?;
     side.frame_data_records =
         load_frame_data_records(pdb_path, layout, &raw_dbi.debug_streams, &names_by_offset)?;
+    let raw_module_debug = load_module_debug_scopes(
+        pdb_path,
+        layout,
+        &raw_dbi,
+        &names_by_offset,
+        &type_by_index,
+        &id_by_index,
+    )?;
+    side.module_subsections = raw_module_debug.subsections;
+    side.module_files = raw_module_debug.files;
+    side.module_lines = raw_module_debug.lines;
+    side.module_strings = raw_module_debug.strings;
+    side.module_frame_data = raw_module_debug.frame_data;
+    side.module_inlinees = raw_module_debug.inlinees;
+    side.module_cross_imports = raw_module_debug.cross_imports;
+    side.module_cross_exports = raw_module_debug.cross_exports;
+    side.module_other_c13 = raw_module_debug.other;
     side.stream_roles.sort_by(|left, right| {
         left.stream_index
             .cmp(&right.stream_index)
@@ -1542,11 +1654,18 @@ fn load_global_string_table(
     let Some(bytes) = layout.read_stream(pdb_path, stream_index)? else {
         return Ok(RawGlobalStringTable::default());
     };
+    parse_global_string_table(&bytes, &format!("named /names stream {stream_index}"))
+}
+
+fn parse_global_string_table(
+    bytes: &[u8],
+    label: &str,
+) -> vostok_pdb_parser::Result<RawGlobalStringTable> {
+    if bytes.is_empty() {
+        return Ok(RawGlobalStringTable::default());
+    }
     if raw_u32(&bytes, 0)? != 0xeffe_effe {
-        return vostok_pdb_parser::error!(
-            "named /names stream {} has an invalid signature",
-            stream_index
-        );
+        return vostok_pdb_parser::error!("{label} has an invalid signature");
     }
     let hash_version = raw_u32(&bytes, 4)?;
     let names_size = raw_u32(&bytes, 8)? as usize;
@@ -1762,6 +1881,9 @@ struct RawDbiInventory {
     debug_streams: Vec<(&'static str, u32)>,
     substreams: Vec<OrderItem>,
     source_files: Vec<ModuleOrderScope>,
+    ec_names: Vec<OrderItem>,
+    ec_metadata: Vec<OrderItem>,
+    ec_hash_buckets: Vec<OrderItem>,
 }
 
 struct RawDbiModule {
@@ -1881,6 +2003,18 @@ fn load_raw_dbi_inventory(
         .ok_or_else(|| vostok_pdb_parser::Error::new("DBI file-info is out of range".into()))?;
     inventory.source_files =
         load_dbi_source_file_scopes(&bytes[file_info_offset..file_info_end], &inventory.modules)?;
+
+    let ec_offset = file_info_end
+        .checked_add(type_server_map_size)
+        .ok_or_else(|| vostok_pdb_parser::Error::new("DBI EC offset overflow".into()))?;
+    let ec_end = ec_offset
+        .checked_add(ec_substream_size)
+        .filter(|end| *end <= bytes.len())
+        .ok_or_else(|| vostok_pdb_parser::Error::new("DBI EC substream is out of range".into()))?;
+    let ec = parse_global_string_table(&bytes[ec_offset..ec_end], "DBI EC string table")?;
+    inventory.ec_names = ec.names;
+    inventory.ec_metadata = ec.metadata;
+    inventory.ec_hash_buckets = ec.hash_buckets;
 
     let debug_offset = 64usize
         .checked_add(module_list_size)
@@ -2778,6 +2912,12 @@ struct RawModuleDebugScopes {
     subsections: Vec<ModuleOrderScope>,
     files: Vec<ModuleOrderScope>,
     lines: Vec<ModuleOrderScope>,
+    strings: Vec<ModuleOrderScope>,
+    frame_data: Vec<ModuleOrderScope>,
+    inlinees: Vec<ModuleOrderScope>,
+    cross_imports: Vec<ModuleOrderScope>,
+    cross_exports: Vec<ModuleOrderScope>,
+    other: Vec<ModuleOrderScope>,
 }
 
 struct RawC13Subsection<'a> {
@@ -2790,16 +2930,31 @@ fn load_module_debug_scopes(
     pdb_path: &PathBuf,
     layout: &MsfLayout,
     dbi: &RawDbiInventory,
+    global_names: &HashMap<usize, String>,
+    types: &HashMap<u32, OrderItem>,
+    ids: &HashMap<u32, OrderItem>,
 ) -> vostok_pdb_parser::Result<RawModuleDebugScopes> {
     let mut result = RawModuleDebugScopes {
         subsections: Vec::with_capacity(dbi.modules.len()),
         files: Vec::with_capacity(dbi.modules.len()),
         lines: Vec::with_capacity(dbi.modules.len()),
+        strings: Vec::with_capacity(dbi.modules.len()),
+        frame_data: Vec::with_capacity(dbi.modules.len()),
+        inlinees: Vec::with_capacity(dbi.modules.len()),
+        cross_imports: Vec::with_capacity(dbi.modules.len()),
+        cross_exports: Vec::with_capacity(dbi.modules.len()),
+        other: Vec::with_capacity(dbi.modules.len()),
     };
     for module in &dbi.modules {
         let mut subsection_items = Vec::new();
         let mut file_items = Vec::new();
         let mut line_items = Vec::new();
+        let mut string_items = Vec::new();
+        let mut frame_data_items = Vec::new();
+        let mut inlinee_items = Vec::new();
+        let mut cross_import_items = Vec::new();
+        let mut cross_export_items = Vec::new();
+        let mut other_items = Vec::new();
         if module.c13_lines_size != 0 {
             if let Some(stream_index) = module.stream_index {
                 if let Some(bytes) = layout.read_stream(pdb_path, stream_index)? {
@@ -2873,6 +3028,9 @@ fn load_module_debug_scopes(
                         .find(|subsection| subsection.kind == 0xf3)
                         .map(|subsection| subsection.data)
                         .unwrap_or_default();
+                    let (parsed_strings, local_names) =
+                        parse_raw_c13_string_table(string_table, &module.value)?;
+                    string_items = parsed_strings;
                     let mut file_names = HashMap::new();
                     let mut file_occurrences = HashMap::new();
                     for subsection in subsections
@@ -2901,6 +3059,84 @@ fn load_module_debug_scopes(
                             &module.value,
                         )?;
                     }
+                    for (occurrence, subsection) in subsections
+                        .iter()
+                        .filter(|subsection| subsection.kind == 0xf5)
+                        .enumerate()
+                    {
+                        append_prefixed_items(
+                            "frame-data",
+                            occurrence,
+                            parse_frame_data_records(
+                                subsection.data,
+                                &local_names,
+                                &format!("C13 frame data for {}", module.value),
+                            )?,
+                            &mut frame_data_items,
+                        );
+                    }
+                    for (occurrence, subsection) in subsections
+                        .iter()
+                        .filter(|subsection| subsection.kind == 0xf6)
+                        .enumerate()
+                    {
+                        append_prefixed_items(
+                            "inlinees",
+                            occurrence,
+                            parse_raw_c13_inlinees(
+                                subsection.data,
+                                &file_names,
+                                ids,
+                                &module.value,
+                            )?,
+                            &mut inlinee_items,
+                        );
+                    }
+                    for (occurrence, subsection) in subsections
+                        .iter()
+                        .filter(|subsection| subsection.kind == 0xf7)
+                        .enumerate()
+                    {
+                        append_prefixed_items(
+                            "cross-imports",
+                            occurrence,
+                            parse_raw_c13_cross_imports(
+                                subsection.data,
+                                global_names,
+                                &module.value,
+                            )?,
+                            &mut cross_import_items,
+                        );
+                    }
+                    for (occurrence, subsection) in subsections
+                        .iter()
+                        .filter(|subsection| subsection.kind == 0xf8)
+                        .enumerate()
+                    {
+                        append_prefixed_items(
+                            "cross-exports",
+                            occurrence,
+                            parse_raw_c13_cross_exports(
+                                subsection.data,
+                                types,
+                                ids,
+                                &module.value,
+                            )?,
+                            &mut cross_export_items,
+                        );
+                    }
+                    for (occurrence, subsection) in subsections
+                        .iter()
+                        .filter(|subsection| !matches!(subsection.kind, 0xf2..=0xf8))
+                        .enumerate()
+                    {
+                        append_prefixed_items(
+                            &format!("kind=0x{:x}", subsection.kind),
+                            occurrence,
+                            parse_raw_c13_words(subsection.data),
+                            &mut other_items,
+                        );
+                    }
                 }
             }
         }
@@ -2919,8 +3155,265 @@ fn load_module_debug_scopes(
             value: module.value.clone(),
             symbols: line_items,
         });
+        result.strings.push(ModuleOrderScope {
+            key: module.key.clone(),
+            value: module.value.clone(),
+            symbols: string_items,
+        });
+        result.frame_data.push(ModuleOrderScope {
+            key: module.key.clone(),
+            value: module.value.clone(),
+            symbols: frame_data_items,
+        });
+        result.inlinees.push(ModuleOrderScope {
+            key: module.key.clone(),
+            value: module.value.clone(),
+            symbols: inlinee_items,
+        });
+        result.cross_imports.push(ModuleOrderScope {
+            key: module.key.clone(),
+            value: module.value.clone(),
+            symbols: cross_import_items,
+        });
+        result.cross_exports.push(ModuleOrderScope {
+            key: module.key.clone(),
+            value: module.value.clone(),
+            symbols: cross_export_items,
+        });
+        result.other.push(ModuleOrderScope {
+            key: module.key.clone(),
+            value: module.value.clone(),
+            symbols: other_items,
+        });
     }
     Ok(result)
+}
+
+fn append_prefixed_items(
+    domain: &str,
+    subsection_occurrence: usize,
+    items: Vec<OrderItem>,
+    output: &mut Vec<OrderItem>,
+) {
+    output.extend(items.into_iter().map(|item| OrderItem {
+        key: format!("{domain}|subsection={subsection_occurrence}|{}", item.key),
+        value: format!("{domain} subsection#{subsection_occurrence} {}", item.value),
+        comparison_value: item.comparison_value,
+    }));
+}
+
+fn parse_raw_c13_string_table(
+    bytes: &[u8],
+    module: &str,
+) -> vostok_pdb_parser::Result<(Vec<OrderItem>, HashMap<usize, String>)> {
+    let mut output = Vec::new();
+    let mut by_offset = HashMap::new();
+    let mut occurrences = HashMap::new();
+    let mut cursor = 0usize;
+    while cursor < bytes.len() {
+        let offset = cursor;
+        let (value, next) = raw_cstring(bytes, cursor, bytes.len()).map_err(|_| {
+            vostok_pdb_parser::Error::new(format!(
+                "unterminated C13 string at 0x{cursor:x} for {module}"
+            ))
+        })?;
+        let semantic = if value.contains('\\') {
+            normalize_pdb_path(&value)
+        } else {
+            value.clone()
+        };
+        let occurrence = occurrences.entry(semantic.clone()).or_insert(0usize);
+        output.push(OrderItem {
+            key: format!("{semantic}|occurrence={occurrence}"),
+            value: format!("offset=0x{offset:x} string={value:?}"),
+            comparison_value: semantic.clone(),
+        });
+        *occurrence += 1;
+        by_offset.insert(offset, semantic);
+        cursor = next;
+    }
+    Ok((output, by_offset))
+}
+
+fn parse_raw_c13_inlinees(
+    bytes: &[u8],
+    file_names: &HashMap<u32, String>,
+    ids: &HashMap<u32, OrderItem>,
+    module: &str,
+) -> vostok_pdb_parser::Result<Vec<OrderItem>> {
+    if bytes.len() < 4 {
+        return vostok_pdb_parser::error!("C13 inlinee subsection is truncated for {module}");
+    }
+    let signature = raw_u32(bytes, 0)?;
+    if signature > 1 {
+        return vostok_pdb_parser::error!(
+            "C13 inlinee subsection has unknown signature {signature} for {module}"
+        );
+    }
+    let mut output = Vec::new();
+    let mut occurrences = HashMap::new();
+    let mut cursor = 4usize;
+    while cursor < bytes.len() {
+        if cursor + 12 > bytes.len() {
+            return vostok_pdb_parser::error!("truncated C13 inlinee record for {module}");
+        }
+        let inlinee = raw_u32(bytes, cursor)?;
+        let file_id = raw_u32(bytes, cursor + 4)?;
+        let line = raw_u32(bytes, cursor + 8)?;
+        cursor += 12;
+        let mut extra_files = Vec::new();
+        if signature == 1 {
+            let count = raw_u32(bytes, cursor)? as usize;
+            cursor += 4;
+            let end = cursor
+                .checked_add(count.saturating_mul(4))
+                .filter(|end| *end <= bytes.len())
+                .ok_or_else(|| {
+                    vostok_pdb_parser::Error::new(format!(
+                        "C13 inlinee extra files cross subsection for {module}"
+                    ))
+                })?;
+            for position in 0..count {
+                let extra_id = raw_u32(bytes, cursor + position * 4)?;
+                extra_files.push(resolve_c13_file(file_names, extra_id));
+            }
+            cursor = end;
+        }
+        let identity = record_identity(ids, inlinee, "ipi");
+        let file = resolve_c13_file(file_names, file_id);
+        let semantic_key = format!("{}|file={file}|line={line}", identity.key);
+        let occurrence = occurrences.entry(semantic_key.clone()).or_insert(0usize);
+        let key = format!("{semantic_key}|occurrence={occurrence}");
+        *occurrence += 1;
+        let detail = format!(
+            "{} file={file} line={line} extra-files={extra_files:?} signature={signature}",
+            identity.comparison_value
+        );
+        output.push(OrderItem {
+            key,
+            value: format!("inlinee-index=0x{inlinee:x} file-id=0x{file_id:x} {detail}"),
+            comparison_value: detail,
+        });
+    }
+    Ok(output)
+}
+
+fn resolve_c13_file(file_names: &HashMap<u32, String>, file_id: u32) -> String {
+    file_names
+        .get(&file_id)
+        .cloned()
+        .unwrap_or_else(|| format!("<unresolved-file-id-0x{file_id:x}>"))
+}
+
+fn parse_raw_c13_cross_imports(
+    bytes: &[u8],
+    global_names: &HashMap<usize, String>,
+    module: &str,
+) -> vostok_pdb_parser::Result<Vec<OrderItem>> {
+    let mut output = Vec::new();
+    let mut module_occurrences = HashMap::new();
+    let mut cursor = 0usize;
+    while cursor < bytes.len() {
+        if cursor + 8 > bytes.len() {
+            return vostok_pdb_parser::error!("truncated C13 cross-import header for {module}");
+        }
+        let module_offset = raw_u32(bytes, cursor)? as usize;
+        let count = raw_u32(bytes, cursor + 4)? as usize;
+        cursor += 8;
+        let end = cursor
+            .checked_add(count.saturating_mul(4))
+            .filter(|end| *end <= bytes.len())
+            .ok_or_else(|| {
+                vostok_pdb_parser::Error::new(format!(
+                    "C13 cross imports cross subsection for {module}"
+                ))
+            })?;
+        let imported_module = global_names
+            .get(&module_offset)
+            .cloned()
+            .unwrap_or_else(|| format!("<unresolved-module-offset-0x{module_offset:x}>"));
+        let occurrence = module_occurrences
+            .entry(imported_module.clone())
+            .or_insert(0usize);
+        let prefix = format!("module={imported_module}|occurrence={occurrence}");
+        *occurrence += 1;
+        output.push(OrderItem {
+            key: format!("{prefix}|header"),
+            value: format!(
+                "module-offset=0x{module_offset:x} module={imported_module} imports={count}"
+            ),
+            comparison_value: format!("module={imported_module}|imports={count}"),
+        });
+        for position in 0..count {
+            let local_index = raw_u32(bytes, cursor + position * 4)?;
+            let detail = format!("module={imported_module}|local-index=0x{local_index:x}");
+            output.push(OrderItem {
+                key: format!("{prefix}|import#{position}"),
+                value: detail.clone(),
+                comparison_value: detail,
+            });
+        }
+        cursor = end;
+    }
+    Ok(output)
+}
+
+fn parse_raw_c13_cross_exports(
+    bytes: &[u8],
+    types: &HashMap<u32, OrderItem>,
+    ids: &HashMap<u32, OrderItem>,
+    module: &str,
+) -> vostok_pdb_parser::Result<Vec<OrderItem>> {
+    if bytes.len() % 8 != 0 {
+        return vostok_pdb_parser::error!(
+            "C13 cross-export subsection is not pair-aligned for {module}"
+        );
+    }
+    let mut output = Vec::with_capacity(bytes.len() / 8);
+    let mut occurrences = HashMap::new();
+    for position in 0..bytes.len() / 8 {
+        let local = raw_u32(bytes, position * 8)?;
+        let global = raw_u32(bytes, position * 8 + 4)?;
+        let is_id = local & 0x8000_0000 != 0;
+        let identity = record_identity(
+            if is_id { ids } else { types },
+            global,
+            if is_id { "ipi" } else { "tpi" },
+        );
+        let semantic_key = format!(
+            "{}|local=0x{local:x}|{}",
+            if is_id { "id" } else { "type" },
+            identity.key
+        );
+        let occurrence = occurrences.entry(semantic_key.clone()).or_insert(0usize);
+        output.push(OrderItem {
+            key: format!("{semantic_key}|occurrence={occurrence}"),
+            value: format!(
+                "export#{position} local=0x{local:x} global=0x{global:x} {}",
+                identity.comparison_value
+            ),
+            comparison_value: format!(
+                "kind={}|local=0x{local:x}|{}",
+                if is_id { "id" } else { "type" },
+                identity.comparison_value
+            ),
+        });
+        *occurrence += 1;
+    }
+    Ok(output)
+}
+
+fn parse_raw_c13_words(bytes: &[u8]) -> Vec<OrderItem> {
+    let mut output = Vec::with_capacity(bytes.len().div_ceil(4));
+    for (position, chunk) in bytes.chunks(4).enumerate() {
+        let value = format!("0x{}", hex_bytes(chunk));
+        output.push(OrderItem {
+            key: format!("word#{position}"),
+            value: value.clone(),
+            comparison_value: value,
+        });
+    }
+    output
 }
 
 fn append_raw_c13_files(
@@ -3257,6 +3750,8 @@ fn msf_layout_summary(
         format: layout.format.to_owned(),
         page_size: layout.page_size,
         free_page_map: layout.free_page_map,
+        free_page_map_pages: layout.free_page_map_pages.clone(),
+        free_pages: layout.free_pages.len(),
         pages_used: layout.pages_used,
         file_bytes: std::fs::metadata(path)?.len(),
         directory_size: layout.directory_size,
@@ -3932,6 +4427,7 @@ fn render_order_report(report: &OrderReport, limit: usize) -> String {
         let _ = writeln!(out, "  {} — {}: {}", row.channel, row.status, row.note);
     }
     render_msf_layout(&mut out, &report.msf_layout, limit);
+    render_sequence_comparison(&mut out, &report.msf_free_pages, limit);
     render_sequence_comparison(&mut out, &report.stream_roles, limit);
     render_sequence_comparison(&mut out, &report.dbi_substreams, limit);
     render_scoped_stream_report(
@@ -3940,6 +4436,9 @@ fn render_order_report(report: &OrderReport, limit: usize) -> String {
         &report.dbi_source_file_streams,
         limit,
     );
+    render_sequence_comparison(&mut out, &report.dbi_ec_names, limit);
+    render_sequence_comparison(&mut out, &report.dbi_ec_metadata, limit);
+    render_sequence_comparison(&mut out, &report.dbi_ec_hash_buckets, limit);
     render_sequence_comparison(&mut out, &report.named_streams, limit);
     render_sequence_comparison(&mut out, &report.named_stream_buckets, limit);
     render_sequence_comparison(&mut out, &report.deleted_named_stream_buckets, limit);
@@ -4027,6 +4526,42 @@ fn render_order_report(report: &OrderReport, limit: usize) -> String {
         &report.module_subsection_streams,
         limit,
     );
+    render_scoped_stream_report(
+        &mut out,
+        "module C13 string-table scopes",
+        &report.module_string_streams,
+        limit,
+    );
+    render_scoped_stream_report(
+        &mut out,
+        "module C13 frame-data scopes",
+        &report.module_frame_data_streams,
+        limit,
+    );
+    render_scoped_stream_report(
+        &mut out,
+        "module C13 inlinee scopes",
+        &report.module_inlinee_streams,
+        limit,
+    );
+    render_scoped_stream_report(
+        &mut out,
+        "module C13 cross-import scopes",
+        &report.module_cross_import_streams,
+        limit,
+    );
+    render_scoped_stream_report(
+        &mut out,
+        "module C13 cross-export scopes",
+        &report.module_cross_export_streams,
+        limit,
+    );
+    render_scoped_stream_report(
+        &mut out,
+        "module other C13 payload scopes",
+        &report.module_other_c13_streams,
+        limit,
+    );
     let _ = writeln!(
         out,
         "\n[module symbol scopes] paired={} different={} ambiguous={}",
@@ -4053,11 +4588,13 @@ fn render_msf_layout(out: &mut String, comparison: &MsfLayoutComparison, limit: 
     let target = &comparison.target;
     let _ = writeln!(
         out,
-        "\n[MSF container layout — {}]\n  base:   {} page=0x{:x} fpm={} pages={} bytes={} directory={} ({} pages/{} runs via {} map pages) streams={}/{} present, bytes={}, stream-pages={}, runs={}, fragmented={}\n  target: {} page=0x{:x} fpm={} pages={} bytes={} directory={} ({} pages/{} runs via {} map pages) streams={}/{} present, bytes={}, stream-pages={}, runs={}, fragmented={}\n  identified roles={} unidentified base={} target={}",
+        "\n[MSF container layout — {}]\n  base:   {} page=0x{:x} fpm={} ({} map pages, {} free) pages={} bytes={} directory={} ({} pages/{} runs via {} map pages) streams={}/{} present, bytes={}, stream-pages={}, runs={}, fragmented={}\n  target: {} page=0x{:x} fpm={} ({} map pages, {} free) pages={} bytes={} directory={} ({} pages/{} runs via {} map pages) streams={}/{} present, bytes={}, stream-pages={}, runs={}, fragmented={}\n  identified roles={} unidentified base={} target={}",
         comparison.confidence,
         base.format,
         base.page_size,
         base.free_page_map,
+        base.free_page_map_pages.len(),
+        base.free_pages,
         base.pages_used,
         base.file_bytes,
         base.directory_size,
@@ -4073,6 +4610,8 @@ fn render_msf_layout(out: &mut String, comparison: &MsfLayoutComparison, limit: 
         target.format,
         target.page_size,
         target.free_page_map,
+        target.free_page_map_pages.len(),
+        target.free_pages,
         target.pages_used,
         target.file_bytes,
         target.directory_size,
@@ -6956,6 +7495,83 @@ mod tests {
         assert_eq!(records[0].key, "rva=0x200|occurrence=0");
         assert!(records[0].comparison_value.contains("frame program"));
         assert!(records[0].comparison_value.contains("function-start=1"));
+    }
+
+    #[test]
+    fn pdb_string_table_preserves_strings_metadata_and_hash_buckets() {
+        let names = b"\0sample\0";
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&0xeffe_effe_u32.to_le_bytes());
+        bytes.extend_from_slice(&1_u32.to_le_bytes());
+        bytes.extend_from_slice(&(names.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(names);
+        bytes.extend_from_slice(&2_u32.to_le_bytes());
+        bytes.extend_from_slice(&0_u32.to_le_bytes());
+        bytes.extend_from_slice(&1_u32.to_le_bytes());
+        bytes.extend_from_slice(&2_u32.to_le_bytes());
+
+        let table = parse_global_string_table(&bytes, "test string table").unwrap();
+        assert_eq!(table.names.len(), 2);
+        assert_eq!(
+            table.names_by_offset.get(&1).map(String::as_str),
+            Some("sample")
+        );
+        assert_eq!(table.metadata.len(), 5);
+        assert_eq!(table.hash_buckets.len(), 2);
+        assert!(table.hash_buckets[1].comparison_value.contains("sample"));
+    }
+
+    #[test]
+    fn c13_inner_record_decoders_preserve_nested_order() {
+        let strings = b"\0src\\sample.cpp\0frame program\0";
+        let (items, local_names) = parse_raw_c13_string_table(strings, "sample.obj").unwrap();
+        assert_eq!(items.len(), 3);
+        assert_eq!(
+            local_names.get(&1).map(String::as_str),
+            Some("src/sample.cpp")
+        );
+
+        let file_names = HashMap::from([(0_u32, "src/sample.cpp".to_owned())]);
+        let ids = HashMap::from([(0x1000_u32, order_item("inline-fn"))]);
+        let mut inlinees = Vec::new();
+        inlinees.extend_from_slice(&1_u32.to_le_bytes());
+        inlinees.extend_from_slice(&0x1000_u32.to_le_bytes());
+        inlinees.extend_from_slice(&0_u32.to_le_bytes());
+        inlinees.extend_from_slice(&42_u32.to_le_bytes());
+        inlinees.extend_from_slice(&1_u32.to_le_bytes());
+        inlinees.extend_from_slice(&0_u32.to_le_bytes());
+        let inlinees = parse_raw_c13_inlinees(&inlinees, &file_names, &ids, "sample.obj").unwrap();
+        assert_eq!(inlinees.len(), 1);
+        assert!(inlinees[0].comparison_value.contains("inline-fn"));
+        assert!(
+            inlinees[0]
+                .comparison_value
+                .contains("extra-files=[\"src/sample.cpp\"]")
+        );
+
+        let global_names = HashMap::from([(7_usize, "other.obj".to_owned())]);
+        let mut imports = Vec::new();
+        imports.extend_from_slice(&7_u32.to_le_bytes());
+        imports.extend_from_slice(&2_u32.to_le_bytes());
+        imports.extend_from_slice(&0x1000_u32.to_le_bytes());
+        imports.extend_from_slice(&0x1001_u32.to_le_bytes());
+        let imports = parse_raw_c13_cross_imports(&imports, &global_names, "sample.obj").unwrap();
+        assert_eq!(imports.len(), 3);
+        assert!(imports[0].comparison_value.contains("imports=2"));
+        assert!(imports[2].comparison_value.contains("local-index=0x1001"));
+
+        let types = HashMap::from([(0x2000_u32, order_item("sample-type"))]);
+        let mut exports = Vec::new();
+        exports.extend_from_slice(&0x1000_u32.to_le_bytes());
+        exports.extend_from_slice(&0x2000_u32.to_le_bytes());
+        let exports =
+            parse_raw_c13_cross_exports(&exports, &types, &HashMap::new(), "sample.obj").unwrap();
+        assert_eq!(exports.len(), 1);
+        assert!(exports[0].comparison_value.contains("sample-type"));
+
+        let words = parse_raw_c13_words(&[1, 2, 3, 4, 5, 6]);
+        assert_eq!(words.len(), 2);
+        assert_eq!(words[1].comparison_value, "0x0506");
     }
 
     fn class_variant(size: u64, type_indices: &[u32]) -> ClassModel {

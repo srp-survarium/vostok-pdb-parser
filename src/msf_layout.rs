@@ -22,6 +22,8 @@ pub struct MsfLayout {
     pub free_page_map: u32,
     pub pages_used: u32,
     pub directory_size: u32,
+    pub free_page_map_pages: Vec<u32>,
+    pub free_pages: Vec<u32>,
     pub directory_map_pages: Vec<u32>,
     pub directory_pages: Vec<u32>,
     pub streams: Vec<MsfStreamLayout>,
@@ -106,6 +108,8 @@ impl MsfLayout {
         let mut directory = read_pages(&mut file, page_size, pages_used, &directory_pages)?;
         directory.truncate(directory_size as usize);
         let streams = parse_big_directory(&directory, page_size, pages_used)?;
+        let (free_page_map_pages, free_pages) =
+            load_free_page_map(&mut file, page_size, pages_used, free_page_map)?;
 
         Ok(Self {
             format: "MSF 7.00",
@@ -113,6 +117,8 @@ impl MsfLayout {
             free_page_map,
             pages_used,
             directory_size,
+            free_page_map_pages,
+            free_pages,
             directory_map_pages,
             directory_pages,
             streams,
@@ -139,6 +145,8 @@ impl MsfLayout {
         let mut directory = read_pages(&mut file, page_size, pages_used, &directory_pages)?;
         directory.truncate(directory_size as usize);
         let streams = parse_small_directory(&directory, page_size, pages_used)?;
+        let (free_page_map_pages, free_pages) =
+            load_free_page_map(&mut file, page_size, pages_used, free_page_map)?;
 
         Ok(Self {
             format: "MSF 2.00",
@@ -146,6 +154,8 @@ impl MsfLayout {
             free_page_map,
             pages_used,
             directory_size,
+            free_page_map_pages,
+            free_pages,
             directory_map_pages: Vec::new(),
             directory_pages,
             streams,
@@ -243,6 +253,34 @@ fn read_pages(file: &mut File, page_size: u32, pages_used: u32, pages: &[u32]) -
     Ok(output)
 }
 
+fn load_free_page_map(
+    file: &mut File,
+    page_size: u32,
+    pages_used: u32,
+    first_page: u32,
+) -> Result<(Vec<u32>, Vec<u32>)> {
+    if first_page != 1 && first_page != 2 {
+        bail!("MSF active free-page map begins at page {first_page}, expected 1 or 2")
+    }
+    let map_page_count = pages_used.div_ceil(page_size.saturating_mul(8));
+    let mut map_pages = Vec::with_capacity(map_page_count as usize);
+    for position in 0..map_page_count {
+        let page = first_page
+            .checked_add(position.saturating_mul(page_size))
+            .ok_or_else(|| crate::Error::new("MSF free-page map index overflow".into()))?;
+        validate_page(page, pages_used)?;
+        map_pages.push(page);
+    }
+    let bits = read_pages(file, page_size, pages_used, &map_pages)?;
+    let mut free_pages = Vec::new();
+    for page in 0..pages_used {
+        if bits[page as usize / 8] & (1 << (page % 8)) != 0 {
+            free_pages.push(page);
+        }
+    }
+    Ok((map_pages, free_pages))
+}
+
 fn validate_file_size(file: &File, page_size: u32, pages_used: u32) -> Result<()> {
     let required = u64::from(page_size) * u64::from(pages_used);
     let actual = file.metadata()?.len();
@@ -295,26 +333,27 @@ mod tests {
     #[test]
     fn parses_big_msf_stream_slots_and_physical_pages() {
         let page_size = 0x100usize;
-        let mut bytes = vec![0u8; page_size * 8];
+        let mut bytes = vec![0u8; page_size * 10];
         bytes[..BIG_MAGIC.len()].copy_from_slice(BIG_MAGIC);
         put_u32(&mut bytes, 32, page_size as u32);
-        put_u32(&mut bytes, 36, 7);
-        put_u32(&mut bytes, 40, 8);
+        put_u32(&mut bytes, 36, 1);
+        put_u32(&mut bytes, 40, 10);
         put_u32(&mut bytes, 44, 28);
-        put_u32(&mut bytes, 52, 1); // directory-map page
-        put_u32(&mut bytes, page_size, 2); // directory page
+        put_u32(&mut bytes, 52, 3); // directory-map page
+        put_u32(&mut bytes, page_size * 3, 4); // directory page
 
-        let directory = page_size * 2;
+        let directory = page_size * 4;
         put_u32(&mut bytes, directory, 3);
         put_u32(&mut bytes, directory + 4, 0);
         put_u32(&mut bytes, directory + 8, 4);
         put_u32(&mut bytes, directory + 12, 300);
-        put_u32(&mut bytes, directory + 16, 3);
-        put_u32(&mut bytes, directory + 20, 4);
-        put_u32(&mut bytes, directory + 24, 5);
-        bytes[page_size * 3..page_size * 3 + 4].copy_from_slice(b"info");
-        bytes[page_size * 4..page_size * 4 + 256].fill(0xa5);
-        bytes[page_size * 5..page_size * 5 + 44].fill(0x5a);
+        put_u32(&mut bytes, directory + 16, 5);
+        put_u32(&mut bytes, directory + 20, 6);
+        put_u32(&mut bytes, directory + 24, 7);
+        bytes[page_size * 5..page_size * 5 + 4].copy_from_slice(b"info");
+        bytes[page_size * 6..page_size * 6 + 256].fill(0xa5);
+        bytes[page_size * 7..page_size * 7 + 44].fill(0x5a);
+        bytes[page_size + 1] = 0b0000_0011; // pages 8 and 9 are free
 
         let path = std::env::temp_dir().join(format!(
             "vostok-pdb-parser-msf-layout-{}.pdb",
@@ -323,13 +362,15 @@ mod tests {
         std::fs::write(&path, bytes).unwrap();
         let layout = MsfLayout::parse(&path).unwrap();
         assert_eq!(layout.format, "MSF 7.00");
-        assert_eq!(layout.directory_map_pages, [1]);
-        assert_eq!(layout.directory_pages, [2]);
+        assert_eq!(layout.free_page_map_pages, [1]);
+        assert_eq!(layout.free_pages, [8, 9]);
+        assert_eq!(layout.directory_map_pages, [3]);
+        assert_eq!(layout.directory_pages, [4]);
         assert_eq!(layout.streams.len(), 3);
         assert_eq!(layout.streams[0].size, Some(0));
         assert!(layout.streams[0].pages.is_empty());
-        assert_eq!(layout.streams[1].pages, [3]);
-        assert_eq!(layout.streams[2].pages, [4, 5]);
+        assert_eq!(layout.streams[1].pages, [5]);
+        assert_eq!(layout.streams[2].pages, [6, 7]);
         assert_eq!(layout.streams[2].page_runs(), 1);
         let stream = layout.read_stream(&path, 2).unwrap().unwrap();
         assert_eq!(stream.len(), 300);
