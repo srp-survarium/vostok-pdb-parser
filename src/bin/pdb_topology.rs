@@ -61,7 +61,7 @@ struct Cli {
     #[arg(
         long,
         requires = "target_pdb",
-        conflicts_with_all = ["pdb", "function", "module", "classes", "class_filter", "show_identical"]
+        conflicts_with_all = ["pdb", "function", "classes", "class_filter", "show_identical"]
     )]
     order: bool,
 
@@ -77,7 +77,8 @@ struct Cli {
     #[arg(long, requires = "classes")]
     show_identical: bool,
 
-    /// Optional case-insensitive module/object/library substring.
+    /// Optional case-insensitive module/object/library substring. With --order,
+    /// emit only the focused DBI module sequence without loading other channels.
     #[arg(long)]
     module: Option<String>,
 
@@ -127,16 +128,30 @@ fn run(cli: &Cli) -> vostok_pdb_parser::Result<()> {
     let output = if cli.order {
         let target_pdb = cli.target_pdb.as_ref().expect("clap requires target PDB");
         let base_pdb = cli.base_pdb.as_ref().expect("clap requires base PDB");
-        let report = build_order_report(target_pdb, base_pdb)?;
-        if cli.json {
-            serde_json::to_string_pretty(&report).unwrap_or_else(|error| {
-                format!(
-                    "{{\"error\":{}}}\n",
-                    serde_json::Value::String(error.to_string())
-                )
-            })
+        if let Some(module) = &cli.module {
+            let report = build_focused_module_order_report(target_pdb, base_pdb, module)?;
+            if cli.json {
+                serde_json::to_string_pretty(&report).unwrap_or_else(|error| {
+                    format!(
+                        "{{\"error\":{}}}\n",
+                        serde_json::Value::String(error.to_string())
+                    )
+                })
+            } else {
+                render_focused_module_order_report(&report, cli.limit)
+            }
         } else {
-            render_order_report(&report, cli.limit)
+            let report = build_order_report(target_pdb, base_pdb)?;
+            if cli.json {
+                serde_json::to_string_pretty(&report).unwrap_or_else(|error| {
+                    format!(
+                        "{{\"error\":{}}}\n",
+                        serde_json::Value::String(error.to_string())
+                    )
+                })
+            } else {
+                render_order_report(&report, cli.limit)
+            }
         }
     } else if cli.classes {
         let target_pdb = cli.target_pdb.as_ref().expect("clap requires target PDB");
@@ -417,6 +432,7 @@ struct OrderSide {
     ipi_index_offsets: Vec<OrderItem>,
     ipi_hash_adjustments: Vec<OrderItem>,
     named_types: Vec<OrderItem>,
+    named_type_module_references: Vec<OrderItem>,
     enum_values: Vec<ModuleOrderScope>,
     raw_global_symbols: Vec<OrderItem>,
     global_symbols: Vec<OrderItem>,
@@ -488,6 +504,7 @@ struct OrderReport {
     tpi_index_offsets: SequenceComparison,
     tpi_hash_adjustments: SequenceComparison,
     named_types: SequenceComparison,
+    named_type_module_references: SequenceComparison,
     named_type_kinds: Vec<ScopedSequenceSummary>,
     enum_value_streams: ScopedStreamReport,
     raw_id_records: SequenceComparison,
@@ -680,6 +697,69 @@ struct ChangedOrderItem {
     target_position: usize,
 }
 
+#[derive(serde::Serialize)]
+struct FocusedModuleOrderReport {
+    target_pdb: String,
+    base_pdb: String,
+    filter: String,
+    target_sequence: Vec<OrderItem>,
+    base_sequence: Vec<OrderItem>,
+    modules: SequenceComparison,
+}
+
+fn build_focused_module_order_report(
+    target_pdb: &PathBuf,
+    base_pdb: &PathBuf,
+    filter: &str,
+) -> vostok_pdb_parser::Result<FocusedModuleOrderReport> {
+    let target_sequence = load_focused_module_order(target_pdb, filter)?;
+    let base_sequence = load_focused_module_order(base_pdb, filter)?;
+    let modules = compare_sequence(
+        "focused DBI module/object sequence",
+        "semantic/linker-derived; filtered from serialized DBI module order",
+        &base_sequence,
+        &target_sequence,
+    );
+    Ok(FocusedModuleOrderReport {
+        target_pdb: target_pdb.display().to_string(),
+        base_pdb: base_pdb.display().to_string(),
+        filter: filter.to_owned(),
+        target_sequence,
+        base_sequence,
+        modules,
+    })
+}
+
+fn load_focused_module_order(
+    pdb_path: &PathBuf,
+    filter: &str,
+) -> vostok_pdb_parser::Result<Vec<OrderItem>> {
+    let file = std::fs::File::open(pdb_path)?;
+    let mut pdb = pdb::PDB::open(file)?;
+    let dbi = pdb.debug_information()?;
+    let mut modules = dbi.modules()?;
+    let needle = filter.to_lowercase();
+    let mut output = Vec::new();
+    while let Some(module) = modules.next()? {
+        let module_name = module.module_name().into_owned();
+        let object_file_name = module.object_file_name().into_owned();
+        if !module_order_matches_filter(&module_name, &object_file_name, &needle) {
+            continue;
+        }
+        let key = module_order_key(&module_name, &object_file_name);
+        output.push(OrderItem {
+            key: key.clone(),
+            value: format!("module={module_name} object={object_file_name}"),
+            comparison_value: key,
+        });
+    }
+    Ok(output)
+}
+
+fn module_order_matches_filter(module_name: &str, object_file_name: &str, needle: &str) -> bool {
+    module_name.to_lowercase().contains(needle) || object_file_name.to_lowercase().contains(needle)
+}
+
 fn build_order_report(
     target_pdb: &PathBuf,
     base_pdb: &PathBuf,
@@ -852,6 +932,12 @@ fn build_order_report(
         "physical/linker-deduplicated",
         &base.named_types,
         &target.named_types,
+    );
+    let named_type_module_references = compare_sequence(
+        "named TPI direct module references",
+        "compiler/linker-emitted; earliest retained module reference is a contributor clue, not proof of original ownership",
+        &base.named_type_module_references,
+        &target.named_type_module_references,
     );
     let named_type_kinds = summarize_grouped_sequences(
         "named complete TPI records by kind",
@@ -1120,6 +1206,7 @@ fn build_order_report(
         tpi_index_offsets,
         tpi_hash_adjustments,
         named_types,
+        named_type_module_references,
         named_type_kinds,
         enum_value_streams,
         raw_id_records,
@@ -1181,6 +1268,11 @@ fn order_coverage() -> Vec<OrderCoverage> {
             channel: "TPI/IPI records and auxiliary hash streams",
             status: "records and hash buffers semantic/ordinal",
             note: "record hashes, index checkpoints and adjustment buckets are decoded; unnamed record identity remains insertion-sensitive",
+        },
+        OrderCoverage {
+            channel: "named TPI direct module references",
+            status: "semantic reference sets in DBI module order",
+            note: "direct local/data/UDT symbol type indexes bind named records to retained compilands; earliest reference is a first-contributor clue, not a canonical owner claim",
         },
         OrderCoverage {
             channel: "complete enum field lists",
@@ -1278,11 +1370,15 @@ fn load_order_side(pdb_path: &PathBuf) -> vostok_pdb_parser::Result<OrderSide> {
     side.layout = Some(layout);
     let mut global_symbol_by_offset = HashMap::new();
     let mut type_by_index = HashMap::new();
+    let mut named_type_items = Vec::new();
     let mut id_by_index = HashMap::new();
+    let mut procedure_identities: HashMap<u32, BTreeSet<String>> = HashMap::new();
+    let mut module_type_references: HashMap<u32, BTreeSet<(usize, String)>> = HashMap::new();
 
     PdbParser::with(pdb_path, |fmt| {
         let file = std::fs::File::open(pdb_path)?;
         let mut pdb = pdb::PDB::open(file)?;
+        let address_map = pdb.address_map()?;
 
         {
             let info = pdb.pdb_information()?;
@@ -1337,6 +1433,7 @@ fn load_order_side(pdb_path: &PathBuf) -> vostok_pdb_parser::Result<OrderSide> {
                 }
                 if let Some(item) = named_type_order_item(&fmt, record.index().0, data) {
                     side.named_types.push(item.clone());
+                    named_type_items.push((record.index().0, item.clone()));
                     type_by_index.insert(record.index().0, item);
                 } else {
                     type_by_index.insert(record.index().0, raw_item);
@@ -1398,8 +1495,28 @@ fn load_order_side(pdb_path: &PathBuf) -> vostok_pdb_parser::Result<OrderSide> {
                         } else {
                             depth
                         };
-                        if record_depth == 0 {
-                            if let Ok(data) = symbol.parse() {
+                        if let Ok(data) = symbol.parse() {
+                            if let Some(type_index) = direct_symbol_type_index(&data) {
+                                module_type_references
+                                    .entry(type_index)
+                                    .or_default()
+                                    .insert((module_id, key.clone()));
+                            }
+                            if record_depth == 0 {
+                                if let SymbolData::Procedure(value) = &data {
+                                    if let Some(rva) = value.offset.to_rva(&address_map) {
+                                        let name = function_name(
+                                            &fmt,
+                                            module_id,
+                                            &value.name,
+                                            value.type_index,
+                                        );
+                                        procedure_identities
+                                            .entry(rva.0)
+                                            .or_default()
+                                            .insert(named_order_item("procedure", name).key);
+                                    }
+                                }
                                 if let Some(item) = module_symbol_order_item(&fmt, module_id, data)
                                 {
                                     ordered_symbols.push(item);
@@ -1589,9 +1706,23 @@ fn load_order_side(pdb_path: &PathBuf) -> vostok_pdb_parser::Result<OrderSide> {
         side.string_table_hash_buckets = names.hash_buckets;
         names_by_offset = names.names_by_offset;
     }
-    side.legacy_fpo_records = load_legacy_fpo_records(pdb_path, layout, &raw_dbi.debug_streams)?;
-    side.frame_data_records =
-        load_frame_data_records(pdb_path, layout, &raw_dbi.debug_streams, &names_by_offset)?;
+    let procedure_by_rva = procedure_identities
+        .into_iter()
+        .filter_map(|(rva, identities)| {
+            (identities.len() == 1).then(|| (rva, identities.into_iter().next().unwrap()))
+        })
+        .collect();
+    side.named_type_module_references =
+        build_named_type_module_references(&named_type_items, &module_type_references);
+    side.legacy_fpo_records =
+        load_legacy_fpo_records(pdb_path, layout, &raw_dbi.debug_streams, &procedure_by_rva)?;
+    side.frame_data_records = load_frame_data_records(
+        pdb_path,
+        layout,
+        &raw_dbi.debug_streams,
+        &names_by_offset,
+        &procedure_by_rva,
+    )?;
     let raw_module_debug = load_module_debug_scopes(
         pdb_path,
         layout,
@@ -2197,6 +2328,7 @@ fn load_legacy_fpo_records(
     pdb_path: &PathBuf,
     layout: &MsfLayout,
     debug_streams: &[(&'static str, u32)],
+    procedure_by_rva: &HashMap<u32, String>,
 ) -> vostok_pdb_parser::Result<Vec<OrderItem>> {
     let Some(stream_index) = debug_streams
         .iter()
@@ -2207,11 +2339,16 @@ fn load_legacy_fpo_records(
     let bytes = layout
         .read_stream(pdb_path, stream_index)?
         .ok_or_else(|| vostok_pdb_parser::Error::new("legacy FPO stream is absent".into()))?;
-    parse_legacy_fpo_records(&bytes, &format!("legacy FPO stream {stream_index}"))
+    parse_legacy_fpo_records(
+        &bytes,
+        procedure_by_rva,
+        &format!("legacy FPO stream {stream_index}"),
+    )
 }
 
 fn parse_legacy_fpo_records(
     bytes: &[u8],
+    procedure_by_rva: &HashMap<u32, String>,
     label: &str,
 ) -> vostok_pdb_parser::Result<Vec<OrderItem>> {
     const RECORD_SIZE: usize = 16;
@@ -2219,7 +2356,7 @@ fn parse_legacy_fpo_records(
         return vostok_pdb_parser::error!("{label} is not {RECORD_SIZE}-byte record aligned");
     }
     let mut output = Vec::with_capacity(bytes.len() / RECORD_SIZE);
-    let mut occurrences = HashMap::new();
+    let mut occurrences: HashMap<String, usize> = HashMap::new();
     for position in 0..bytes.len() / RECORD_SIZE {
         let cursor = position * RECORD_SIZE;
         let rva = raw_u32(&bytes, cursor)?;
@@ -2227,8 +2364,12 @@ fn parse_legacy_fpo_records(
         let locals_words = raw_u32(&bytes, cursor + 8)?;
         let params_words = raw_u16(&bytes, cursor + 12)?;
         let attributes = raw_u16(&bytes, cursor + 14)?;
-        let occurrence = occurrences.entry(rva).or_insert(0usize);
-        let key = format!("rva=0x{rva:x}|occurrence={occurrence}");
+        let identity = procedure_by_rva
+            .get(&rva)
+            .cloned()
+            .unwrap_or_else(|| format!("rva=0x{rva:x}"));
+        let occurrence = occurrences.entry(identity.clone()).or_insert(0usize);
+        let key = format!("{identity}|occurrence={occurrence}");
         *occurrence += 1;
         let detail = format!(
             "rva=0x{rva:x} size=0x{code_size:x} locals-words={locals_words} params-words={params_words} prolog={} saved-regs={} seh={} use-bp={} reserved={} frame-type={} attributes=0x{attributes:04x}",
@@ -2239,10 +2380,15 @@ fn parse_legacy_fpo_records(
             (attributes >> 13) & 1,
             attributes >> 14,
         );
+        let comparison_value = if procedure_by_rva.contains_key(&rva) {
+            detail.replacen(&format!("rva=0x{rva:x} "), "", 1)
+        } else {
+            detail.clone()
+        };
         output.push(OrderItem {
             key,
             value: format!("record#{position} {detail}"),
-            comparison_value: detail,
+            comparison_value,
         });
     }
     Ok(output)
@@ -2253,6 +2399,7 @@ fn load_frame_data_records(
     layout: &MsfLayout,
     debug_streams: &[(&'static str, u32)],
     names_by_offset: &HashMap<usize, String>,
+    procedure_by_rva: &HashMap<u32, String>,
 ) -> vostok_pdb_parser::Result<Vec<OrderItem>> {
     let Some(stream_index) = debug_streams
         .iter()
@@ -2266,6 +2413,7 @@ fn load_frame_data_records(
     parse_frame_data_records(
         &bytes,
         names_by_offset,
+        procedure_by_rva,
         &format!("frame-data stream {stream_index}"),
     )
 }
@@ -2273,6 +2421,7 @@ fn load_frame_data_records(
 fn parse_frame_data_records(
     bytes: &[u8],
     names_by_offset: &HashMap<usize, String>,
+    procedure_by_rva: &HashMap<u32, String>,
     label: &str,
 ) -> vostok_pdb_parser::Result<Vec<OrderItem>> {
     const RECORD_SIZE: usize = 32;
@@ -2280,7 +2429,7 @@ fn parse_frame_data_records(
         return vostok_pdb_parser::error!("{label} is not {RECORD_SIZE}-byte record aligned");
     }
     let mut output = Vec::with_capacity(bytes.len() / RECORD_SIZE);
-    let mut occurrences = HashMap::new();
+    let mut occurrences: HashMap<String, usize> = HashMap::new();
     for position in 0..bytes.len() / RECORD_SIZE {
         let cursor = position * RECORD_SIZE;
         let rva = raw_u32(&bytes, cursor)?;
@@ -2296,8 +2445,12 @@ fn parse_frame_data_records(
             .get(&frame_func_offset)
             .cloned()
             .unwrap_or_else(|| format!("<unresolved-offset-0x{frame_func_offset:x}>"));
-        let occurrence = occurrences.entry(rva).or_insert(0usize);
-        let key = format!("rva=0x{rva:x}|occurrence={occurrence}");
+        let identity = procedure_by_rva
+            .get(&rva)
+            .cloned()
+            .unwrap_or_else(|| format!("rva=0x{rva:x}"));
+        let occurrence = occurrences.entry(identity.clone()).or_insert(0usize);
+        let key = format!("{identity}|occurrence={occurrence}");
         *occurrence += 1;
         let detail = format!(
             "rva=0x{rva:x} size=0x{code_size:x} locals=0x{locals_size:x} params=0x{params_size:x} max-stack=0x{max_stack_size:x} frame-func={frame_func:?} prolog={prolog_size} saved-regs={saved_regs_size} seh={} eh={} function-start={} reserved=0x{:x}",
@@ -2306,10 +2459,15 @@ fn parse_frame_data_records(
             (flags >> 2) & 1,
             flags >> 3,
         );
+        let comparison_value = if procedure_by_rva.contains_key(&rva) {
+            detail.replacen(&format!("rva=0x{rva:x} "), "", 1)
+        } else {
+            detail.clone()
+        };
         output.push(OrderItem {
             key,
             value: format!("record#{position} frame-func-offset=0x{frame_func_offset:x} {detail}"),
-            comparison_value: detail,
+            comparison_value,
         });
     }
     Ok(output)
@@ -3040,6 +3198,7 @@ fn load_module_debug_scopes(
                         append_raw_c13_files(
                             subsection,
                             string_table,
+                            global_names,
                             &mut file_names,
                             &mut file_occurrences,
                             &mut file_items,
@@ -3070,6 +3229,7 @@ fn load_module_debug_scopes(
                             parse_frame_data_records(
                                 subsection.data,
                                 &local_names,
+                                &HashMap::new(),
                                 &format!("C13 frame data for {}", module.value),
                             )?,
                             &mut frame_data_items,
@@ -3419,6 +3579,7 @@ fn parse_raw_c13_words(bytes: &[u8]) -> Vec<OrderItem> {
 fn append_raw_c13_files(
     subsection: &RawC13Subsection<'_>,
     string_table: &[u8],
+    global_names: &HashMap<usize, String>,
     file_names: &mut HashMap<u32, String>,
     occurrences: &mut HashMap<String, usize>,
     output: &mut Vec<OrderItem>,
@@ -3441,8 +3602,12 @@ fn append_raw_c13_files(
                     "C13 file checksum payload is out of range in {module}"
                 ))
             })?;
-        let name = raw_string_at(string_table, name_offset as usize)
-            .unwrap_or_else(|| format!("<string-offset-0x{name_offset:x}>"));
+        let name = if string_table.is_empty() {
+            global_names.get(&(name_offset as usize)).cloned()
+        } else {
+            raw_string_at(string_table, name_offset as usize)
+        }
+        .unwrap_or_else(|| format!("<string-offset-0x{name_offset:x}>"));
         let normalized = normalize_pdb_path(&name);
         let occurrence = occurrences.entry(normalized.clone()).or_default();
         let key = format!("{normalized}|occurrence={occurrence}");
@@ -3907,6 +4072,54 @@ fn named_type_order_item(
         value: format!("type=0x{index:x} {kind} {name} {detail}"),
         comparison_value: format!("{kind}|{normalized}|{detail}"),
     })
+}
+
+fn direct_symbol_type_index(data: &SymbolData<'_>) -> Option<u32> {
+    let index = match data {
+        SymbolData::Procedure(value) => value.type_index,
+        SymbolData::RegisterVariable(value) => value.type_index,
+        SymbolData::MultiRegisterVariable(value) => value.type_index,
+        SymbolData::Constant(value) => value.type_index,
+        SymbolData::UserDefinedType(value) => value.type_index,
+        SymbolData::Data(value) => value.type_index,
+        SymbolData::ThreadStorage(value) => value.type_index,
+        SymbolData::Local(value) => value.type_index,
+        SymbolData::ManagedSlot(value) => value.type_index,
+        SymbolData::RegisterRelative(value) => value.type_index,
+        SymbolData::BasePointerRelative(value) => value.type_index,
+        SymbolData::CallSiteInfo(value) => value.type_index,
+        _ => return None,
+    };
+    Some(index.0)
+}
+
+fn build_named_type_module_references(
+    named_types: &[(u32, OrderItem)],
+    references: &HashMap<u32, BTreeSet<(usize, String)>>,
+) -> Vec<OrderItem> {
+    named_types
+        .iter()
+        .filter_map(|(type_index, item)| {
+            let modules = references.get(type_index)?;
+            let module_keys: Vec<&str> = modules
+                .iter()
+                .map(|(_, module_key)| module_key.as_str())
+                .collect();
+            let first = module_keys.first()?;
+            let module_sequence = module_keys.join(" -> ");
+            Some(OrderItem {
+                key: item.key.clone(),
+                value: format!(
+                    "{} first-direct-module={} direct-modules=[{}]",
+                    item.value, first, module_sequence
+                ),
+                comparison_value: format!(
+                    "{}|direct-modules=[{}]",
+                    item.comparison_value, module_sequence
+                ),
+            })
+        })
+        .collect()
 }
 
 fn module_symbol_order_item(
@@ -4414,6 +4627,27 @@ fn sequence_differs(comparison: &SequenceComparison) -> bool {
         || !comparison.moved.is_empty()
 }
 
+fn render_focused_module_order_report(report: &FocusedModuleOrderReport, limit: usize) -> String {
+    let mut out = String::new();
+    let _ = writeln!(out, "target PDB: {}", report.target_pdb);
+    let _ = writeln!(out, "base PDB:   {}", report.base_pdb);
+    let _ = writeln!(out, "DBI module filter: {:?}", report.filter);
+    let _ = writeln!(
+        out,
+        "focused mode reads serialized DBI modules only; it does not imply source ownership"
+    );
+    let _ = writeln!(out, "\n[target DBI module sequence]");
+    for (position, item) in report.target_sequence.iter().enumerate() {
+        let _ = writeln!(out, "  {position:>5}: {}", item.value);
+    }
+    let _ = writeln!(out, "\n[base DBI module sequence]");
+    for (position, item) in report.base_sequence.iter().enumerate() {
+        let _ = writeln!(out, "  {position:>5}: {}", item.value);
+    }
+    render_sequence_comparison(&mut out, &report.modules, limit);
+    out
+}
+
 fn render_order_report(report: &OrderReport, limit: usize) -> String {
     let mut out = String::new();
     let _ = writeln!(out, "target PDB: {}", report.target_pdb);
@@ -4464,6 +4698,7 @@ fn render_order_report(report: &OrderReport, limit: usize) -> String {
     render_sequence_comparison(&mut out, &report.tpi_index_offsets, limit);
     render_sequence_comparison(&mut out, &report.tpi_hash_adjustments, limit);
     render_sequence_comparison(&mut out, &report.named_types, limit);
+    render_sequence_comparison(&mut out, &report.named_type_module_references, limit);
     render_scoped_summaries(
         &mut out,
         "TPI order by named-record kind",
@@ -7257,6 +7492,25 @@ mod tests {
     }
 
     #[test]
+    fn focused_module_filter_checks_module_and_container_paths() {
+        assert!(module_order_matches_filter(
+            "c:\\build\\vfs\\find.obj",
+            "c:\\build\\vostok_vfs.lib",
+            "vfs"
+        ));
+        assert!(module_order_matches_filter(
+            "c:\\build\\core\\find.obj",
+            "c:\\build\\vostok_vfs.lib",
+            "vostok_vfs"
+        ));
+        assert!(!module_order_matches_filter(
+            "c:\\build\\core\\find.obj",
+            "c:\\build\\vostok_core.lib",
+            "vfs"
+        ));
+    }
+
+    #[test]
     fn sequence_order_excludes_duplicate_keys_from_order_claims() {
         let base = [order_item("a"), order_item("a"), order_item("b")];
         let target = [order_item("a"), order_item("b")];
@@ -7312,6 +7566,38 @@ mod tests {
     }
 
     #[test]
+    fn named_type_module_references_preserve_dbi_order_without_claiming_ownership() {
+        let named_types = [(
+            0x1001,
+            OrderItem {
+                key: "struct|shared_type".to_owned(),
+                value: "type=0x1001 struct shared_type size=0x4".to_owned(),
+                comparison_value: "struct|shared_type|size=0x4".to_owned(),
+            },
+        )];
+        let references = HashMap::from([(
+            0x1001,
+            BTreeSet::from([
+                (2, "beta.obj|probe.lib".to_owned()),
+                (1, "alpha.obj|probe.lib".to_owned()),
+            ]),
+        )]);
+
+        let output = build_named_type_module_references(&named_types, &references);
+        assert_eq!(output.len(), 1);
+        assert!(
+            output[0]
+                .value
+                .contains("first-direct-module=alpha.obj|probe.lib")
+        );
+        assert!(
+            output[0]
+                .comparison_value
+                .ends_with("direct-modules=[alpha.obj|probe.lib -> beta.obj|probe.lib]")
+        );
+    }
+
+    #[test]
     fn raw_c13_files_and_lines_preserve_serialized_order() {
         let mut checksums = Vec::new();
         checksums.extend_from_slice(&1_u32.to_le_bytes());
@@ -7327,6 +7613,7 @@ mod tests {
         append_raw_c13_files(
             &file_subsection,
             b"\0src\\sample.cpp\0",
+            &HashMap::new(),
             &mut file_names,
             &mut file_occurrences,
             &mut files,
@@ -7339,6 +7626,30 @@ mod tests {
         );
         assert_eq!(files.len(), 1);
         assert!(files[0].comparison_value.contains("checksum=aabbccdd"));
+
+        let global_names = HashMap::from([(1_usize, "src\\global.cpp".to_owned())]);
+        let mut global_file_names = HashMap::new();
+        let mut global_occurrences = HashMap::new();
+        let mut global_files = Vec::new();
+        append_raw_c13_files(
+            &file_subsection,
+            b"",
+            &global_names,
+            &mut global_file_names,
+            &mut global_occurrences,
+            &mut global_files,
+            "sample.obj",
+        )
+        .unwrap();
+        assert_eq!(
+            global_file_names.get(&0).map(String::as_str),
+            Some("src/global.cpp")
+        );
+        assert!(
+            global_files[0]
+                .comparison_value
+                .contains("path=src/global.cpp")
+        );
 
         let mut lines = Vec::new();
         lines.extend_from_slice(&0x100_u32.to_le_bytes());
@@ -7475,7 +7786,7 @@ mod tests {
         legacy.extend_from_slice(&3_u32.to_le_bytes());
         legacy.extend_from_slice(&2_u16.to_le_bytes());
         legacy.extend_from_slice(&attributes.to_le_bytes());
-        let records = parse_legacy_fpo_records(&legacy, "test FPO").unwrap();
+        let records = parse_legacy_fpo_records(&legacy, &HashMap::new(), "test FPO").unwrap();
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].key, "rva=0x100|occurrence=0");
         assert!(records[0].comparison_value.contains("prolog=5"));
@@ -7490,11 +7801,88 @@ mod tests {
         frame.extend_from_slice(&4_u16.to_le_bytes());
         frame.extend_from_slice(&7_u32.to_le_bytes());
         let names = HashMap::from([(7, "frame program".to_owned())]);
-        let records = parse_frame_data_records(&frame, &names, "test frame data").unwrap();
+        let records =
+            parse_frame_data_records(&frame, &names, &HashMap::new(), "test frame data").unwrap();
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].key, "rva=0x200|occurrence=0");
         assert!(records[0].comparison_value.contains("frame program"));
         assert!(records[0].comparison_value.contains("function-start=1"));
+    }
+
+    #[test]
+    fn frame_data_order_uses_unique_procedure_identity_instead_of_rva() {
+        let record = |rva: u32, code_size: u32, locals_size: u32| {
+            let mut bytes = Vec::new();
+            for value in [rva, code_size, locals_size, 4, 0, 0] {
+                bytes.extend_from_slice(&value.to_le_bytes());
+            }
+            bytes.extend_from_slice(&3_u16.to_le_bytes());
+            bytes.extend_from_slice(&0_u16.to_le_bytes());
+            bytes.extend_from_slice(&4_u32.to_le_bytes());
+            bytes
+        };
+        let mut base_bytes = record(0x100, 0x20, 0x0c);
+        base_bytes.extend(record(0x200, 0x30, 0x1c));
+        let mut target_bytes = record(0x100, 0x30, 0x1c);
+        target_bytes.extend(record(0x200, 0x20, 0x0c));
+        let base_procedures = HashMap::from([
+            (0x100, "procedure|alpha".to_owned()),
+            (0x200, "procedure|beta".to_owned()),
+        ]);
+        let target_procedures = HashMap::from([
+            (0x100, "procedure|beta".to_owned()),
+            (0x200, "procedure|alpha".to_owned()),
+        ]);
+        let base = parse_frame_data_records(
+            &base_bytes,
+            &HashMap::new(),
+            &base_procedures,
+            "base frame data",
+        )
+        .unwrap();
+        let target = parse_frame_data_records(
+            &target_bytes,
+            &HashMap::new(),
+            &target_procedures,
+            "target frame data",
+        )
+        .unwrap();
+        let comparison = compare_sequence("frame data", "address-derived", &base, &target);
+        assert_eq!(comparison.order_metrics.inversions, 1);
+        assert_eq!(comparison.moved.len(), 2);
+        assert!(comparison.changed.is_empty());
+    }
+
+    #[test]
+    fn legacy_fpo_order_uses_unique_procedure_identity_instead_of_rva() {
+        let record = |rva: u32, code_size: u32, locals_words: u32| {
+            let mut bytes = Vec::new();
+            bytes.extend_from_slice(&rva.to_le_bytes());
+            bytes.extend_from_slice(&code_size.to_le_bytes());
+            bytes.extend_from_slice(&locals_words.to_le_bytes());
+            bytes.extend_from_slice(&1_u16.to_le_bytes());
+            bytes.extend_from_slice(&5_u16.to_le_bytes());
+            bytes
+        };
+        let mut base_bytes = record(0x100, 0x20, 3);
+        base_bytes.extend(record(0x200, 0x30, 7));
+        let mut target_bytes = record(0x100, 0x30, 7);
+        target_bytes.extend(record(0x200, 0x20, 3));
+        let base_procedures = HashMap::from([
+            (0x100, "procedure|alpha".to_owned()),
+            (0x200, "procedure|beta".to_owned()),
+        ]);
+        let target_procedures = HashMap::from([
+            (0x100, "procedure|beta".to_owned()),
+            (0x200, "procedure|alpha".to_owned()),
+        ]);
+        let base = parse_legacy_fpo_records(&base_bytes, &base_procedures, "base FPO").unwrap();
+        let target =
+            parse_legacy_fpo_records(&target_bytes, &target_procedures, "target FPO").unwrap();
+        let comparison = compare_sequence("legacy FPO", "address-derived", &base, &target);
+        assert_eq!(comparison.order_metrics.inversions, 1);
+        assert_eq!(comparison.moved.len(), 2);
+        assert!(comparison.changed.is_empty());
     }
 
     #[test]
