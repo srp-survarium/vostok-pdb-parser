@@ -14,12 +14,19 @@ struct Cli {
     #[arg(long)]
     target_engine_path: String,
 
+    /// Include every DBI file-checksum record, including headers
+    #[arg(long)]
+    all_files: bool,
+
+    /// Print the target checksum table and exit
+    #[arg(long)]
+    list_checksums: bool,
+
     #[command(flatten)]
     source: SourceArgs,
 }
 
 #[derive(clap::Args)]
-#[group(required = false, multiple = false)]
 struct SourceArgs {
     /// Compare against a compiled base PDB
     #[arg(long, value_hint = clap::ValueHint::FilePath)]
@@ -81,18 +88,37 @@ fn main() -> anyhow::Result<()> {
     let Cli {
         target_pdb,
         target_engine_path,
+        all_files,
+        list_checksums,
         source,
     } = Cli::parse();
 
-    let target = collect_checksums_from_pdb(&target_pdb, &normalize_prefix(&target_engine_path))?;
+    let target = collect_checksums_from_pdb(
+        &target_pdb,
+        &normalize_prefix(&target_engine_path),
+        all_files,
+    )?;
 
-    let base = match (source.base_pdb, source.source_dir) {
-        (Some(pdb_path), _) => {
-            let prefix = normalize_prefix(&source.base_engine_path.unwrap());
-            collect_checksums_from_pdb(&pdb_path, &prefix)?
+    if list_checksums {
+        if source.base_pdb.is_some() || source.source_dir.is_some() {
+            anyhow::bail!("--list-checksums cannot be combined with --base-pdb or --source-dir");
         }
-        (_, Some(dir)) => collect_checksums_from_dir(&dir, &target)?,
-        (None, None) => anyhow::bail!("provide either --base-pdb or --source-dir"),
+        print_checksums(&target);
+        return Ok(());
+    }
+
+    let base = match (source.base_pdb, source.base_engine_path, source.source_dir) {
+        (Some(pdb_path), Some(base_engine_path), None) => {
+            let prefix = normalize_prefix(&base_engine_path);
+            collect_checksums_from_pdb(&pdb_path, &prefix, all_files)?
+        }
+        (None, None, Some(dir)) => collect_checksums_from_dir(&dir, &target)?,
+        (Some(_), None, None) => anyhow::bail!("--base-pdb requires --base-engine-path"),
+        (None, Some(_), _) => anyhow::bail!("--base-engine-path requires --base-pdb"),
+        (None, None, None) => {
+            anyhow::bail!("provide --list-checksums, --base-pdb, or --source-dir")
+        }
+        _ => anyhow::bail!("provide exactly one of --base-pdb or --source-dir"),
     };
 
     print_diff(&base, &target);
@@ -105,6 +131,7 @@ fn main() -> anyhow::Result<()> {
 fn collect_checksums_from_pdb(
     path: &Path,
     engine_prefix: &str,
+    all_files: bool,
 ) -> anyhow::Result<HashMap<String, FileChecksum>> {
     let file = std::fs::File::open(path)?;
     let mut pdb = pdb::PDB::open(file)?;
@@ -121,6 +148,37 @@ fn collect_checksums_from_pdb(
         };
 
         let program = module_info.line_program()?;
+
+        if all_files {
+            let mut files = program.files();
+            while let Some(file_info) = files.next()? {
+                let name = file_info.name.to_string_lossy(&string_table)?;
+                let name_lower = name.to_lowercase();
+                let Some(relative) = name_lower.strip_prefix(engine_prefix) else {
+                    continue;
+                };
+
+                let key = relative.to_owned();
+                let checksum = FileChecksum::from_pdb(file_info.checksum);
+                if matches!(checksum, FileChecksum::None) {
+                    eprintln!("warning: empty checksum for {key}");
+                }
+
+                if let Some(previous) = result.get(&key) {
+                    if previous != &checksum {
+                        anyhow::bail!(
+                            "conflicting checksum records for {}",
+                            key.replace('\\', "/")
+                        );
+                    }
+                    continue;
+                }
+
+                result.insert(key, checksum);
+            }
+            continue;
+        }
+
         let mut symbols = module_info.symbols()?;
 
         while let Some(sym) = symbols.next()? {
@@ -257,6 +315,23 @@ fn sha256_of(data: &[u8]) -> Vec<u8> {
 }
 
 // ── Diff output ───────────────────────────────────────────────────────────────
+
+fn print_checksums(checksums: &HashMap<String, FileChecksum>) {
+    let mut keys: Vec<&String> = checksums.keys().collect();
+    keys.sort();
+
+    for key in keys {
+        let name = key.replace('\\', "/");
+        let (algorithm, bytes): (&str, &[u8]) = match &checksums[key] {
+            FileChecksum::None => ("none", &[]),
+            FileChecksum::Md5(bytes) => ("md5", bytes),
+            FileChecksum::Sha1(bytes) => ("sha1", bytes),
+            FileChecksum::Sha256(bytes) => ("sha256", bytes),
+        };
+        let digest: String = bytes.iter().map(|byte| format!("{byte:02x}")).collect();
+        println!("{algorithm}\t{digest}\t{name}");
+    }
+}
 
 fn print_diff(base: &HashMap<String, FileChecksum>, target: &HashMap<String, FileChecksum>) {
     let mut all_keys: Vec<&String> = base.keys().chain(target.keys()).collect();
