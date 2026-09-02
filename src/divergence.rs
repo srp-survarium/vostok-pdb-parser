@@ -74,6 +74,13 @@ struct SideModel {
     classes: BTreeMap<String, ClassModel>,
     enums: BTreeMap<String, EnumModel>,
     files: BTreeMap<String, FileModel>,
+    presence_functions: Vec<PresenceFn>,
+}
+
+struct PresenceFn {
+    path: String,
+    key: String,
+    name_orig: String,
 }
 
 struct ClassModel {
@@ -516,18 +523,27 @@ fn extract_sources(
     let public = public_function_symbols(pdb)?;
 
     gen_sources::for_each_function(pdb, fmt, GenFlags::empty(), |filename, fun| {
-        // The header side already covers inline functions defined in `.h`; here
-        // we only compare definition order within real compilands.
-        if !matches!(FunctionLocation::get(filename), FunctionLocation::Source) {
-            return;
-        }
-
+        let is_source = matches!(FunctionLocation::get(filename), FunctionLocation::Source);
         let lowered = filename.to_lowercase().replace('/', "\\");
         let Some(relative) = lowered.strip_prefix(engine) else {
             return;
         };
         let relative = relative.trim_start_matches('\\').replace('\\', "/");
         if skipped(&relative, cfg) {
+            return;
+        }
+
+        let mangled = public.get(&fun.offset.0).map(String::as_str);
+        let key = function_join_key(mangled, &fun.name_orig);
+        out.presence_functions.push(PresenceFn {
+            path: relative.clone(),
+            key: key.clone(),
+            name_orig: fun.name_orig.clone(),
+        });
+
+        // Header procedures participate in whole-PDB symbol presence above,
+        // but only real source compilands carry comparable definition order.
+        if !is_source {
             return;
         }
 
@@ -540,9 +556,6 @@ fn extract_sources(
                 value: variant_to_i64(*value),
             })
             .collect();
-
-        let mangled = public.get(&fun.offset.0).map(String::as_str);
-        let key = function_join_key(mangled, &fun.name_orig);
 
         out.files
             .entry(relative)
@@ -977,42 +990,42 @@ struct PresenceDiff {
 /// its signature differently; the readable demangled `name_orig` is what gets
 /// reported for the surplus entries. Exact full signatures are a secondary join
 /// for anonymous/local symbols and functions without a Public record. Presence
-/// is set-valued: repeated module procedure observations of one function still
+/// is compared across the whole PDB: ICF can attribute the same linked body to a
+/// different source file on each side, which is not one-sided symbol presence.
+/// Repeated module procedure observations of one function likewise still
 /// describe one linked out-of-line body and must not create a multiplicity
 /// divergence.
 fn presence_functions(base: &SideModel, target: &SideModel) -> PresenceDiff {
     let mut base_only = Vec::new();
     let mut target_only = Vec::new();
 
-    let paths = union_keys(base.files.keys(), target.files.keys());
-    for path in paths {
-        let base_fns = file_functions(base.files.get(path));
-        let target_fns = file_functions(target.files.get(path));
+    let base_fns = &base.presence_functions;
+    let target_fns = &target.presence_functions;
+    let target_keys: HashSet<&str> = target_fns.iter().map(|fun| fun.key.as_str()).collect();
+    let target_names: HashSet<&str> = target_fns
+        .iter()
+        .map(|fun| fun.name_orig.as_str())
+        .collect();
+    let base_keys: HashSet<&str> = base_fns.iter().map(|fun| fun.key.as_str()).collect();
+    let base_names: HashSet<&str> = base_fns.iter().map(|fun| fun.name_orig.as_str()).collect();
 
-        let target_keys: HashSet<&str> = target_fns.iter().map(|(key, _)| key.as_str()).collect();
-        let target_names: HashSet<&str> =
-            target_fns.iter().map(|(_, name)| name.as_str()).collect();
-        let base_keys: HashSet<&str> = base_fns.iter().map(|(key, _)| key.as_str()).collect();
-        let base_names: HashSet<&str> = base_fns.iter().map(|(_, name)| name.as_str()).collect();
-
-        let mut reported = HashSet::new();
-        for (key, display) in &base_fns {
-            if !target_keys.contains(key.as_str())
-                && !target_names.contains(display.as_str())
-                && reported.insert(display.as_str())
-            {
-                base_only.push((path.clone(), display.clone()));
-            }
+    let mut reported = HashSet::new();
+    for fun in base_fns {
+        if !target_keys.contains(fun.key.as_str())
+            && !target_names.contains(fun.name_orig.as_str())
+            && reported.insert(fun.name_orig.as_str())
+        {
+            base_only.push((fun.path.clone(), fun.name_orig.clone()));
         }
+    }
 
-        let mut reported = HashSet::new();
-        for (key, display) in &target_fns {
-            if !base_keys.contains(key.as_str())
-                && !base_names.contains(display.as_str())
-                && reported.insert(display.as_str())
-            {
-                target_only.push((path.clone(), display.clone()));
-            }
+    let mut reported = HashSet::new();
+    for fun in target_fns {
+        if !base_keys.contains(fun.key.as_str())
+            && !base_names.contains(fun.name_orig.as_str())
+            && reported.insert(fun.name_orig.as_str())
+        {
+            target_only.push((fun.path.clone(), fun.name_orig.clone()));
         }
     }
 
@@ -1020,17 +1033,6 @@ fn presence_functions(base: &SideModel, target: &SideModel) -> PresenceDiff {
         base_only,
         target_only,
     }
-}
-
-/// `(join key, display signature)` for every function in a file, in order.
-fn file_functions(file: Option<&FileModel>) -> Vec<(String, String)> {
-    file.map(|f| {
-        f.functions
-            .iter()
-            .map(|fun| (fun.key.clone(), fun.name_orig.clone()))
-            .collect()
-    })
-    .unwrap_or_default()
 }
 
 fn cross_pdb_function_key(fun: &FnModel, other_names: &HashSet<&str>) -> String {
@@ -1822,6 +1824,12 @@ mod tests {
     fn side_with(files: &[(&str, &[&str])]) -> SideModel {
         let mut out = SideModel::default();
         for (path, sigs) in files {
+            out.presence_functions
+                .extend(sigs.iter().map(|sig| PresenceFn {
+                    path: path.to_string(),
+                    key: sig.to_string(),
+                    name_orig: sig.to_string(),
+                }));
             out.files.insert(
                 path.to_string(),
                 FileModel {
@@ -1848,6 +1856,12 @@ mod tests {
     fn side_with_keyed(files: &[(&str, &[(&str, &str)])]) -> SideModel {
         let mut out = SideModel::default();
         for (path, fns) in files {
+            out.presence_functions
+                .extend(fns.iter().map(|(key, display)| PresenceFn {
+                    path: path.to_string(),
+                    key: key.to_string(),
+                    name_orig: display.to_string(),
+                }));
             out.files.insert(
                 path.to_string(),
                 FileModel {
@@ -1970,6 +1984,15 @@ mod tests {
         // procedure record, but the linked executable still contains one body.
         let base = side_with(&[("m/u.cpp", &["void f()", "void f()"])]);
         let target = side_with(&[("m/u.cpp", &["void f()"])]);
+        let diff = presence_functions(&base, &target);
+        assert!(diff.base_only.is_empty());
+        assert!(diff.target_only.is_empty());
+    }
+
+    #[test]
+    fn presence_ignores_icf_source_attribution_drift() {
+        let base = side_with(&[("m/header.h", &["void folded_f()"]) ]);
+        let target = side_with(&[("m/owner.cpp", &["void folded_f()"]) ]);
         let diff = presence_functions(&base, &target);
         assert!(diff.base_only.is_empty());
         assert!(diff.target_only.is_empty());
