@@ -1143,8 +1143,14 @@ fn diff_file(
             .iter()
             .map(|k| display.get(k).copied().unwrap_or(k).to_string())
             .collect();
+        let base_lines = function_lines(b, t);
+        let target_lines = function_lines(t, b);
+        let base_order = ordered_function_display(&order_moved, &base_lines, &display);
+        let target_order = ordered_function_display(&order_moved, &target_lines, &display);
         lines.push("  [fn-order]".to_string());
         push_list(&mut lines, "    moved      ", &moved);
+        push_list(&mut lines, "    base order ", &base_order);
+        push_list(&mut lines, "    tgt order  ", &target_order);
     }
 
     // Per-function raw line-table/const comparison over functions present on
@@ -1215,6 +1221,29 @@ fn diff_file(
     }
     println!();
     true
+}
+
+fn ordered_function_display(
+    keys: &[String],
+    source_lines: &HashMap<String, u32>,
+    display: &HashMap<String, &str>,
+) -> Vec<String> {
+    let mut ordered = keys.to_vec();
+    ordered.sort_unstable_by(|left, right| {
+        source_lines[left]
+            .cmp(&source_lines[right])
+            .then_with(|| left.cmp(right))
+    });
+    ordered
+        .into_iter()
+        .map(|key| {
+            format!(
+                "line {}: {}",
+                source_lines[&key],
+                display.get(&key).copied().unwrap_or(&key)
+            )
+        })
+        .collect()
 }
 
 // ── Diff primitives ─────────────────────────────────────────────────────────
@@ -2054,6 +2083,27 @@ mod tests {
         assert_eq!(
             function_order_moved(&base.files["m/u.cpp"], &target.files["m/u.cpp"]),
             vec!["name|void f()".to_string(), "name|void g()".to_string()]
+        );
+    }
+
+    #[test]
+    fn ordered_function_display_shows_each_sides_source_order() {
+        let keys = vec!["name|void second()".to_string(), "name|void first()".to_string()];
+        let source_lines = HashMap::from([
+            ("name|void first()".to_string(), 10),
+            ("name|void second()".to_string(), 20),
+        ]);
+        let display = HashMap::from([
+            ("name|void first()".to_string(), "void first()"),
+            ("name|void second()".to_string(), "void second()"),
+        ]);
+
+        assert_eq!(
+            ordered_function_display(&keys, &source_lines, &display),
+            vec![
+                "line 10: void first()".to_string(),
+                "line 20: void second()".to_string(),
+            ]
         );
     }
 
