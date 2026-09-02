@@ -39,6 +39,9 @@ pub struct Function<'a> {
 
     pub proc_start: u32,
     pub proc_end: u32,
+    /// Ordinal of this procedure in its compiland's symbol stream. Unlike
+    /// `proc_start`, this is not affected by source `#line` directives.
+    pub symbol_order: usize,
     pub statements: Vec<Statement>,
 
     pub constants: Vec<(pdb::RawString<'a>, Type, pdb::Variant)>,
@@ -212,6 +215,7 @@ impl<'a> Module<'a> {
 
         let mut function: Function = Function::new(flags);
         let mut depth: i32 = 0;
+        let mut next_symbol_order = 0usize;
 
         let mut filename: String = String::new();
 
@@ -219,6 +223,8 @@ impl<'a> Module<'a> {
             match symbol.parse()? {
                 // FunctionStart
                 SymbolData::Procedure(proc) => {
+                    let symbol_order = next_symbol_order;
+                    next_symbol_order += 1;
                     assert_eq!(
                         depth, 0,
                         "Function cannot be defined inside another function"
@@ -305,6 +311,7 @@ impl<'a> Module<'a> {
                         //
                         proc_start,
                         proc_end,
+                        symbol_order,
                         statements: breakpoints,
                         //
                         margs: Default::default(),
@@ -610,6 +617,7 @@ impl<'a> Function<'a> {
 
             proc_start: Default::default(),
             proc_end: Default::default(),
+            symbol_order: Default::default(),
             statements: Default::default(),
 
             constants: Default::default(),
@@ -723,6 +731,7 @@ impl<'a> Function<'a> {
             //
             proc_start,
             proc_end,
+            symbol_order: _,
             mut statements,
             //
             constants,

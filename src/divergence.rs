@@ -122,6 +122,8 @@ struct FnModel {
     key: String,
     name_orig: String,
     definition_line: u32,
+    module_id: usize,
+    symbol_order: usize,
     raw_line_table_count: usize,
     constants: Vec<ConstModel>,
 }
@@ -571,6 +573,8 @@ fn extract_sources(
                 } else {
                     0
                 },
+                module_id: fun.module_id,
+                symbol_order: fun.symbol_order,
                 raw_line_table_count: fun.statements.len(),
                 constants,
             });
@@ -1070,9 +1074,42 @@ fn function_lines(file: &FileModel, other: &FileModel) -> HashMap<String, u32> {
         .collect()
 }
 
+fn function_symbol_positions(
+    file: &FileModel,
+    other: &FileModel,
+) -> HashMap<String, (usize, usize)> {
+    let other_names: HashSet<&str> = other
+        .functions
+        .iter()
+        .map(|fun| fun.name_orig.as_str())
+        .collect();
+    let mut positions: HashMap<String, Option<(usize, usize)>> = HashMap::new();
+    for fun in &file.functions {
+        if fun.definition_line == 0 {
+            continue;
+        }
+        let key = cross_pdb_function_key(fun, &other_names);
+        let position = (fun.module_id, fun.symbol_order);
+        positions
+            .entry(key)
+            .and_modify(|existing| {
+                if *existing != Some(position) {
+                    *existing = None;
+                }
+            })
+            .or_insert(Some(position));
+    }
+    positions
+        .into_iter()
+        .filter_map(|(key, position)| position.map(|position| (key, position)))
+        .collect()
+}
+
 fn function_order_moved(base: &FileModel, target: &FileModel) -> Vec<String> {
     let base_lines = function_lines(base, target);
     let target_lines = function_lines(target, base);
+    let base_symbols = function_symbol_positions(base, target);
+    let target_symbols = function_symbol_positions(target, base);
     let mut common: Vec<&String> = base_lines
         .keys()
         .filter(|key| target_lines.contains_key(*key))
@@ -1089,7 +1126,25 @@ fn function_order_moved(base: &FileModel, target: &FileModel) -> Vec<String> {
             if base_left == base_right || target_left == target_right {
                 continue;
             }
-            if (base_left < base_right) != (target_left < target_right) {
+            let Some(&(base_left_module, base_left_symbol)) = base_symbols.get(*left) else {
+                continue;
+            };
+            let Some(&(base_right_module, base_right_symbol)) = base_symbols.get(*right) else {
+                continue;
+            };
+            let Some(&(target_left_module, target_left_symbol)) = target_symbols.get(*left) else {
+                continue;
+            };
+            let Some(&(target_right_module, target_right_symbol)) = target_symbols.get(*right) else {
+                continue;
+            };
+            if base_left_module != base_right_module || target_left_module != target_right_module {
+                continue;
+            }
+            let line_inverted = (base_left < base_right) != (target_left < target_right);
+            let symbol_inverted =
+                (base_left_symbol < base_right_symbol) != (target_left_symbol < target_right_symbol);
+            if line_inverted && symbol_inverted {
                 moved.insert((*left).clone());
                 moved.insert((*right).clone());
             }
@@ -1122,8 +1177,10 @@ fn diff_file(
     // (so a demangle-only difference never reads as a reorder). Exact full
     // signatures pair functions whose local/anonymous decorated names are not
     // stable. An inversion is reportable only when both functions have distinct
-    // attributed lines in both PDBs. Same-line and line-zero records provide no
-    // relative source-order evidence.
+    // attributed lines in both PDBs AND the compiland procedure-symbol order
+    // independently inverts. This rejects non-monotonic `#line` mappings without
+    // trusting linker-global order. Same-line, line-zero, cross-module, and
+    // ambiguous records provide no relative source-order evidence.
     let order_moved = function_order_moved(b, t);
     if !order_moved.is_empty() {
         counts.order_diff += 1;
@@ -1143,8 +1200,14 @@ fn diff_file(
             .iter()
             .map(|k| display.get(k).copied().unwrap_or(k).to_string())
             .collect();
+        let base_lines = function_lines(b, t);
+        let target_lines = function_lines(t, b);
+        let base_order = ordered_function_display(&order_moved, &base_lines, &display);
+        let target_order = ordered_function_display(&order_moved, &target_lines, &display);
         lines.push("  [fn-order]".to_string());
         push_list(&mut lines, "    moved      ", &moved);
+        push_list(&mut lines, "    base order ", &base_order);
+        push_list(&mut lines, "    tgt order  ", &target_order);
     }
 
     // Per-function raw line-table/const comparison over functions present on
@@ -1215,6 +1278,29 @@ fn diff_file(
     }
     println!();
     true
+}
+
+fn ordered_function_display(
+    keys: &[String],
+    source_lines: &HashMap<String, u32>,
+    display: &HashMap<String, &str>,
+) -> Vec<String> {
+    let mut ordered = keys.to_vec();
+    ordered.sort_unstable_by(|left, right| {
+        source_lines[left]
+            .cmp(&source_lines[right])
+            .then_with(|| left.cmp(right))
+    });
+    ordered
+        .into_iter()
+        .map(|key| {
+            format!(
+                "line {}: {}",
+                source_lines[&key],
+                display.get(&key).copied().unwrap_or(&key)
+            )
+        })
+        .collect()
 }
 
 // ── Diff primitives ─────────────────────────────────────────────────────────
@@ -1840,6 +1926,8 @@ mod tests {
                             key: sig.to_string(),
                             name_orig: sig.to_string(),
                             definition_line: index as u32,
+                            module_id: 0,
+                            symbol_order: index,
                             raw_line_table_count: 0,
                             constants: Vec::new(),
                         })
@@ -1872,6 +1960,8 @@ mod tests {
                             key: key.to_string(),
                             name_orig: display.to_string(),
                             definition_line: index as u32,
+                            module_id: 0,
+                            symbol_order: index,
                             raw_line_table_count: 0,
                             constants: Vec::new(),
                         })
@@ -2030,6 +2120,20 @@ mod tests {
     }
 
     #[test]
+    fn function_order_rejects_a_line_directive_only_inversion() {
+        let mut base = side_with(&[("m/u.cpp", &["void clear()", "void set()"])]);
+        let mut target = side_with(&[("m/u.cpp", &["void clear()", "void set()"])]);
+        let base_functions = &mut base.files.get_mut("m/u.cpp").unwrap().functions;
+        base_functions[0].definition_line = 104;
+        base_functions[1].definition_line = 96;
+        let target_functions = &mut target.files.get_mut("m/u.cpp").unwrap().functions;
+        target_functions[0].definition_line = 90;
+        target_functions[1].definition_line = 96;
+
+        assert!(function_order_moved(&base.files["m/u.cpp"], &target.files["m/u.cpp"]).is_empty());
+    }
+
+    #[test]
     fn function_order_requires_a_definite_pairwise_inversion() {
         let mut base = side_with(&[("m/u.cpp", &["void f()", "void generated()", "void g()"])]);
         let mut target = side_with(&[("m/u.cpp", &["void f()", "void generated()", "void g()"])]);
@@ -2051,9 +2155,32 @@ mod tests {
         target_functions[0].definition_line = 30;
         target_functions[1].definition_line = 10;
         target_functions[2].definition_line = 10;
+        target_functions[0].symbol_order = 2;
+        target_functions[2].symbol_order = 0;
         assert_eq!(
             function_order_moved(&base.files["m/u.cpp"], &target.files["m/u.cpp"]),
             vec!["name|void f()".to_string(), "name|void g()".to_string()]
+        );
+    }
+
+    #[test]
+    fn ordered_function_display_shows_each_sides_source_order() {
+        let keys = vec!["name|void second()".to_string(), "name|void first()".to_string()];
+        let source_lines = HashMap::from([
+            ("name|void first()".to_string(), 10),
+            ("name|void second()".to_string(), 20),
+        ]);
+        let display = HashMap::from([
+            ("name|void first()".to_string(), "void first()"),
+            ("name|void second()".to_string(), "void second()"),
+        ]);
+
+        assert_eq!(
+            ordered_function_display(&keys, &source_lines, &display),
+            vec![
+                "line 10: void first()".to_string(),
+                "line 20: void second()".to_string(),
+            ]
         );
     }
 
