@@ -1051,6 +1051,10 @@ fn function_order(file: &FileModel, other: &FileModel) -> Vec<String> {
         while end < file.functions.len() && file.functions[end].definition_line == line {
             end += 1;
         }
+        if line == 0 {
+            start = end;
+            continue;
+        }
 
         let mut group: Vec<String> = file.functions[start..end]
             .iter()
@@ -1080,7 +1084,8 @@ fn diff_file(
     // (so a demangle-only difference never reads as a reorder). Exact full
     // signatures pair functions whose local/anonymous decorated names are not
     // stable. Same-line groups are sorted because CodeView provides no source
-    // declaration order within one attributed line.
+    // declaration order within one attributed line; line-zero records are
+    // excluded because they provide no source-order evidence at all.
     let base_order = function_order(b, t);
     let target_order = function_order(t, b);
     let order = seq_diff(&base_order, &target_order);
@@ -1960,6 +1965,19 @@ mod tests {
         assert_eq!(
             function_order(base_file, target_file),
             function_order(target_file, base_file)
+        );
+    }
+
+    #[test]
+    fn function_order_excludes_records_without_a_source_line() {
+        let mut base = side_with(&[("m/u.cpp", &["void generated()", "void source_f()"])]);
+        let mut target = side_with(&[("m/u.cpp", &["void source_f()"])]);
+        base.files.get_mut("m/u.cpp").unwrap().functions[0].definition_line = 0;
+        base.files.get_mut("m/u.cpp").unwrap().functions[1].definition_line = 10;
+        target.files.get_mut("m/u.cpp").unwrap().functions[0].definition_line = 10;
+        assert_eq!(
+            function_order(&base.files["m/u.cpp"], &target.files["m/u.cpp"]),
+            function_order(&target.files["m/u.cpp"], &base.files["m/u.cpp"])
         );
     }
 
