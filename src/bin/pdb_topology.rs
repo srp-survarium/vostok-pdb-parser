@@ -424,12 +424,28 @@ struct SequenceComparison {
     base_total: usize,
     target_total: usize,
     shared_unique: usize,
+    order_metrics: OrderMetrics,
     only_base: Vec<PositionedOrderItem>,
     only_target: Vec<PositionedOrderItem>,
     multiplicity: Vec<MultiplicityDifference>,
     excluded_nonunique: Vec<MultiplicityDifference>,
     changed: Vec<ChangedOrderItem>,
     moved: Vec<MovedOrderItem>,
+}
+
+#[derive(Debug, PartialEq, Eq, serde::Serialize)]
+struct OrderMetrics {
+    // All metrics use only keys that occur exactly once on each side. One-sided
+    // and ambiguous records therefore cannot turn insertions into false moves.
+    comparable_pairs: u64,
+    inversions: u64,
+    longest_ordered_subsequence: usize,
+    preserved_adjacent_pairs: usize,
+    reversed_adjacent_pairs: usize,
+    longest_contiguous_run: usize,
+    increasing_runs: usize,
+    rank_displacement_sum: u64,
+    max_rank_displacement: usize,
 }
 
 #[derive(Clone, serde::Serialize)]
@@ -850,6 +866,7 @@ fn compare_sequence(
                 .map(|target_position| (item, base_position, target_position))
         })
         .collect();
+    let order_metrics = order_metrics(&common);
     let moved = inversion_participants(&common);
 
     SequenceComparison {
@@ -858,6 +875,7 @@ fn compare_sequence(
         base_total: base.len(),
         target_total: target.len(),
         shared_unique: common.len(),
+        order_metrics,
         only_base,
         only_target,
         multiplicity,
@@ -865,6 +883,100 @@ fn compare_sequence(
         changed,
         moved,
     }
+}
+
+fn order_metrics(common: &[(&OrderItem, usize, usize)]) -> OrderMetrics {
+    let mut target_positions: Vec<usize> = common
+        .iter()
+        .map(|(_, _, target_position)| *target_position)
+        .collect();
+    target_positions.sort_unstable();
+    let target_ranks: HashMap<usize, usize> = target_positions
+        .into_iter()
+        .enumerate()
+        .map(|(rank, position)| (position, rank))
+        .collect();
+    let ranks: Vec<usize> = common
+        .iter()
+        .map(|(_, _, target_position)| target_ranks[target_position])
+        .collect();
+    let comparable_pairs =
+        (ranks.len() as u64).saturating_mul(ranks.len().saturating_sub(1) as u64) / 2;
+    let preserved_adjacent_pairs = ranks
+        .windows(2)
+        .filter(|pair| pair[1] == pair[0] + 1)
+        .count();
+    let reversed_adjacent_pairs = ranks
+        .windows(2)
+        .filter(|pair| pair[0] == pair[1] + 1)
+        .count();
+    let increasing_runs = if ranks.is_empty() {
+        0
+    } else {
+        1 + ranks.windows(2).filter(|pair| pair[1] < pair[0]).count()
+    };
+    let longest_contiguous_run = if ranks.is_empty() {
+        0
+    } else {
+        let mut longest = 1;
+        let mut current = 1;
+        for pair in ranks.windows(2) {
+            if pair[1] == pair[0] + 1 {
+                current += 1;
+                longest = longest.max(current);
+            } else {
+                current = 1;
+            }
+        }
+        longest
+    };
+    let mut tails = Vec::new();
+    for &rank in &ranks {
+        let position = tails.partition_point(|&tail| tail < rank);
+        if position == tails.len() {
+            tails.push(rank);
+        } else {
+            tails[position] = rank;
+        }
+    }
+    let rank_displacements: Vec<usize> = ranks
+        .iter()
+        .enumerate()
+        .map(|(base_rank, target_rank)| base_rank.abs_diff(*target_rank))
+        .collect();
+
+    OrderMetrics {
+        comparable_pairs,
+        inversions: inversion_count(&ranks),
+        longest_ordered_subsequence: tails.len(),
+        preserved_adjacent_pairs,
+        reversed_adjacent_pairs,
+        longest_contiguous_run,
+        increasing_runs,
+        rank_displacement_sum: rank_displacements.iter().map(|value| *value as u64).sum(),
+        max_rank_displacement: rank_displacements.into_iter().max().unwrap_or(0),
+    }
+}
+
+fn inversion_count(ranks: &[usize]) -> u64 {
+    let mut tree = vec![0_u64; ranks.len() + 1];
+    let mut inversions = 0_u64;
+    for (seen, &rank) in ranks.iter().enumerate() {
+        let mut index = rank + 1;
+        let mut less_or_equal = 0_u64;
+        while index > 0 {
+            less_or_equal += tree[index];
+            index &= index - 1;
+        }
+        inversions += seen as u64 - less_or_equal;
+
+        let mut index = rank + 1;
+        while index < tree.len() {
+            tree[index] += 1;
+            index += index & (!index + 1);
+        }
+    }
+    inversions
 }
 
 fn order_positions<'a>(
@@ -971,6 +1083,29 @@ fn render_sequence_comparison(out: &mut String, comparison: &SequenceComparison,
         comparison.only_target.len(),
         comparison.multiplicity.len(),
         comparison.excluded_nonunique.len(),
+    );
+    let adjacent_pairs = comparison.shared_unique.saturating_sub(1);
+    let inversion_percent = if comparison.order_metrics.comparable_pairs == 0 {
+        0.0
+    } else {
+        100.0 * comparison.order_metrics.inversions as f64
+            / comparison.order_metrics.comparable_pairs as f64
+    };
+    let _ = writeln!(
+        out,
+        "  locality: inversions={}/{} ({:.4}%) lis={}/{} adjacent={}/{} reversed-adjacent={} longest-contiguous={} increasing-runs={} displacement-sum={} displacement-max={}",
+        comparison.order_metrics.inversions,
+        comparison.order_metrics.comparable_pairs,
+        inversion_percent,
+        comparison.order_metrics.longest_ordered_subsequence,
+        comparison.shared_unique,
+        comparison.order_metrics.preserved_adjacent_pairs,
+        adjacent_pairs,
+        comparison.order_metrics.reversed_adjacent_pairs,
+        comparison.order_metrics.longest_contiguous_run,
+        comparison.order_metrics.increasing_runs,
+        comparison.order_metrics.rank_displacement_sum,
+        comparison.order_metrics.max_rank_displacement,
     );
     for item in comparison.moved.iter().take(limit) {
         let _ = writeln!(
@@ -3298,6 +3433,20 @@ mod tests {
         assert!(comparison.moved.is_empty());
         assert_eq!(comparison.only_target.len(), 1);
         assert_eq!(comparison.only_target[0].key, "inserted");
+        assert_eq!(
+            comparison.order_metrics,
+            OrderMetrics {
+                comparable_pairs: 3,
+                inversions: 0,
+                longest_ordered_subsequence: 3,
+                preserved_adjacent_pairs: 2,
+                reversed_adjacent_pairs: 0,
+                longest_contiguous_run: 3,
+                increasing_runs: 1,
+                rank_displacement_sum: 0,
+                max_rank_displacement: 0,
+            }
+        );
     }
 
     #[test]
@@ -3311,6 +3460,69 @@ mod tests {
             .map(|item| item.key.as_str())
             .collect();
         assert_eq!(moved, BTreeSet::from(["b", "c"]));
+        assert_eq!(comparison.order_metrics.comparable_pairs, 3);
+        assert_eq!(comparison.order_metrics.inversions, 1);
+        assert_eq!(comparison.order_metrics.longest_ordered_subsequence, 2);
+        assert_eq!(comparison.order_metrics.preserved_adjacent_pairs, 0);
+        assert_eq!(comparison.order_metrics.reversed_adjacent_pairs, 1);
+        assert_eq!(comparison.order_metrics.longest_contiguous_run, 1);
+        assert_eq!(comparison.order_metrics.increasing_runs, 2);
+        assert_eq!(comparison.order_metrics.rank_displacement_sum, 2);
+        assert_eq!(comparison.order_metrics.max_rank_displacement, 1);
+    }
+
+    #[test]
+    fn sequence_order_metrics_distinguish_an_intact_rotated_block() {
+        let base = [
+            order_item("a"),
+            order_item("b"),
+            order_item("c"),
+            order_item("d"),
+        ];
+        let target = [
+            order_item("c"),
+            order_item("d"),
+            order_item("a"),
+            order_item("b"),
+        ];
+        let comparison = compare_sequence("test", "diagnostic", &base, &target);
+
+        assert_eq!(comparison.moved.len(), 4);
+        assert_eq!(comparison.order_metrics.comparable_pairs, 6);
+        assert_eq!(comparison.order_metrics.inversions, 4);
+        assert_eq!(comparison.order_metrics.longest_ordered_subsequence, 2);
+        assert_eq!(comparison.order_metrics.preserved_adjacent_pairs, 2);
+        assert_eq!(comparison.order_metrics.reversed_adjacent_pairs, 0);
+        assert_eq!(comparison.order_metrics.longest_contiguous_run, 2);
+        assert_eq!(comparison.order_metrics.increasing_runs, 2);
+        assert_eq!(comparison.order_metrics.rank_displacement_sum, 8);
+        assert_eq!(comparison.order_metrics.max_rank_displacement, 2);
+    }
+
+    #[test]
+    fn sequence_order_metrics_handle_empty_and_singleton_sequences() {
+        let empty = compare_sequence("test", "diagnostic", &[], &[]);
+        assert_eq!(
+            empty.order_metrics,
+            OrderMetrics {
+                comparable_pairs: 0,
+                inversions: 0,
+                longest_ordered_subsequence: 0,
+                preserved_adjacent_pairs: 0,
+                reversed_adjacent_pairs: 0,
+                longest_contiguous_run: 0,
+                increasing_runs: 0,
+                rank_displacement_sum: 0,
+                max_rank_displacement: 0,
+            }
+        );
+
+        let singleton = [order_item("a")];
+        let singleton = compare_sequence("test", "diagnostic", &singleton, &singleton);
+        assert_eq!(singleton.order_metrics.comparable_pairs, 0);
+        assert_eq!(singleton.order_metrics.longest_ordered_subsequence, 1);
+        assert_eq!(singleton.order_metrics.longest_contiguous_run, 1);
+        assert_eq!(singleton.order_metrics.increasing_runs, 1);
     }
 
     #[test]
