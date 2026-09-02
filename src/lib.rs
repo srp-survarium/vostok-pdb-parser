@@ -19,6 +19,7 @@ pub mod rich_structure_diff;
 
 pub mod formatter;
 pub mod helpers;
+pub mod msf_layout;
 pub mod pdb_parser;
 pub mod type_builder;
 
