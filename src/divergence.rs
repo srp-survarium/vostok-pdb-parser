@@ -557,7 +557,12 @@ fn extract_sources(
                 raw_line_table_count: fun.statements.len(),
                 constants,
             });
-    })
+    })?;
+
+    for file in out.files.values_mut() {
+        file.functions.sort_by_key(|fun| fun.definition_line);
+    }
+    Ok(())
 }
 
 /// Build the `RVA -> decorated (mangled) symbol` map for *functions*, from the
