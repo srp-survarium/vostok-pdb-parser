@@ -553,7 +553,11 @@ fn extract_sources(
             .push(FnModel {
                 key,
                 name_orig: fun.name_orig.clone(),
-                definition_line: fun.proc_start,
+                definition_line: if fun.definition_line_is_reliable() {
+                    fun.proc_start
+                } else {
+                    0
+                },
                 raw_line_table_count: fun.statements.len(),
                 constants,
             });

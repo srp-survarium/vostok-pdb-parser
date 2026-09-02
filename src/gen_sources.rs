@@ -576,6 +576,18 @@ impl<'a> Module<'a> {
 }
 
 impl<'a> Function<'a> {
+    /// Whether `proc_start` is usable as source-definition-order evidence.
+    ///
+    /// Synthesized and ICF-aliased procedures can borrow another function's
+    /// CodeView line table. A statement attributed before this procedure's own
+    /// entry proves that happened, so its source line must not participate in
+    /// cross-PDB definition-order comparisons.
+    pub fn definition_line_is_reliable(&self) -> bool {
+        self.statements
+            .iter()
+            .all(|statement| statement.rva.0 >= self.offset.0)
+    }
+
     pub fn new(flags: GenFlags) -> Self {
         Self {
             module_id: Default::default(),
@@ -1033,4 +1045,38 @@ fn assume_namespace(funs: &BTreeMap<u32, Vec<Function>>) -> Namespace {
     }
 
     namespace
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Function, Statement};
+    use crate::GenFlags;
+
+    #[test]
+    fn definition_line_rejects_a_borrowed_line_table() {
+        let mut function = Function::new(GenFlags::empty());
+        function.offset = pdb::Rva(100);
+        function.statements.push(Statement {
+            rva: pdb::Rva(99),
+            ..Default::default()
+        });
+
+        assert!(!function.definition_line_is_reliable());
+    }
+
+    #[test]
+    fn definition_line_accepts_statements_owned_by_the_function() {
+        let mut function = Function::new(GenFlags::empty());
+        function.offset = pdb::Rva(100);
+        function.statements.push(Statement {
+            rva: pdb::Rva(100),
+            ..Default::default()
+        });
+        function.statements.push(Statement {
+            rva: pdb::Rva(120),
+            ..Default::default()
+        });
+
+        assert!(function.definition_line_is_reliable());
+    }
 }
