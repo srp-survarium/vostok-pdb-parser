@@ -403,18 +403,45 @@ struct OrderReport {
     target_pdb: String,
     base_pdb: String,
     modules: SequenceComparison,
+    module_library_sequences: Vec<ScopedSequenceSummary>,
     named_types: SequenceComparison,
+    named_type_kinds: Vec<ScopedSequenceSummary>,
     global_symbols: SequenceComparison,
+    global_symbol_kinds: Vec<ScopedSequenceSummary>,
     paired_module_symbol_streams: usize,
     different_module_symbol_streams: usize,
     ambiguous_module_scopes: Vec<MultiplicityDifference>,
     module_symbols: Vec<ScopedSequenceComparison>,
+    module_symbol_kinds: Vec<ScopedSequenceSummary>,
 }
 
 #[derive(serde::Serialize)]
 struct ScopedSequenceComparison {
     scope: String,
     comparison: SequenceComparison,
+}
+
+#[derive(serde::Serialize)]
+struct ScopedSequenceSummary {
+    scope: String,
+    comparison: SequenceSummary,
+}
+
+#[derive(serde::Serialize)]
+struct SequenceSummary {
+    name: String,
+    confidence: &'static str,
+    different: bool,
+    base_total: usize,
+    target_total: usize,
+    shared_unique: usize,
+    order_metrics: OrderMetrics,
+    only_base: usize,
+    only_target: usize,
+    multiplicity: usize,
+    excluded_nonunique: usize,
+    changed: usize,
+    moved: usize,
 }
 
 #[derive(serde::Serialize)]
@@ -433,7 +460,7 @@ struct SequenceComparison {
     moved: Vec<MovedOrderItem>,
 }
 
-#[derive(Debug, PartialEq, Eq, serde::Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
 struct OrderMetrics {
     // All metrics use only keys that occur exactly once on each side. One-sided
     // and ambiguous records therefore cannot turn insertions into false moves.
@@ -492,17 +519,41 @@ fn build_order_report(
         &base.modules,
         &target.modules,
     );
+    let module_library_sequences = summarize_grouped_sequences(
+        "DBI modules within one library",
+        "physical/linker-derived",
+        &base.modules,
+        &target.modules,
+        module_library_group,
+        2,
+    );
     let named_types = compare_sequence(
         "named complete TPI records",
         "physical/linker-deduplicated",
         &base.named_types,
         &target.named_types,
     );
+    let named_type_kinds = summarize_grouped_sequences(
+        "named complete TPI records by kind",
+        "physical/linker-deduplicated",
+        &base.named_types,
+        &target.named_types,
+        key_prefix_group,
+        1,
+    );
     let global_symbols = compare_sequence(
         "global symbol stream",
         "physical/linker-derived",
         &base.global_symbols,
         &target.global_symbols,
+    );
+    let global_symbol_kinds = summarize_grouped_sequences(
+        "global symbols by kind",
+        "physical/linker-derived",
+        &base.global_symbols,
+        &target.global_symbols,
+        key_prefix_group,
+        1,
     );
 
     let (base_scopes, base_ambiguous) = unique_module_scopes(&base.module_symbols);
@@ -541,11 +592,15 @@ fn build_order_report(
 
     let mut paired_module_symbol_streams = 0usize;
     let mut module_symbols = Vec::new();
-    for (key, target_scope) in target_scopes {
-        let Some(base_scope) = base_scopes.get(&key) else {
+    let mut base_module_symbol_kinds: BTreeMap<String, Vec<OrderItem>> = BTreeMap::new();
+    let mut target_module_symbol_kinds: BTreeMap<String, Vec<OrderItem>> = BTreeMap::new();
+    for (key, target_scope) in &target_scopes {
+        let Some(base_scope) = base_scopes.get(key) else {
             continue;
         };
         paired_module_symbol_streams += 1;
+        append_scoped_symbol_kinds(&mut base_module_symbol_kinds, key, base_scope);
+        append_scoped_symbol_kinds(&mut target_module_symbol_kinds, key, target_scope);
         let comparison = compare_sequence(
             "top-level module symbol stream",
             "physical/linker-derived",
@@ -561,17 +616,28 @@ fn build_order_report(
     }
     module_symbols.sort_by(|left, right| left.scope.cmp(&right.scope));
     let different_module_symbol_streams = module_symbols.len();
+    let module_symbol_kinds = summarize_pre_grouped_sequences(
+        "top-level module symbols by kind in stable module-key order",
+        "compiler-emitted/module-local",
+        base_module_symbol_kinds,
+        target_module_symbol_kinds,
+        1,
+    );
 
     Ok(OrderReport {
         target_pdb: target_pdb.display().to_string(),
         base_pdb: base_pdb.display().to_string(),
         modules,
+        module_library_sequences,
         named_types,
+        named_type_kinds,
         global_symbols,
+        global_symbol_kinds,
         paired_module_symbol_streams,
         different_module_symbol_streams,
         ambiguous_module_scopes,
         module_symbols,
+        module_symbol_kinds,
     })
 }
 
@@ -762,6 +828,118 @@ fn module_order_key(module_name: &str, object_file_name: &str) -> String {
         module_leaf(module_name).to_lowercase(),
         module_leaf(object_file_name).to_lowercase()
     )
+}
+
+fn module_library_group(item: &OrderItem) -> Option<String> {
+    let (_, container) = item.key.rsplit_once('|')?;
+    container.ends_with(".lib").then(|| container.to_owned())
+}
+
+fn key_prefix_group(item: &OrderItem) -> Option<String> {
+    item.key
+        .split_once('|')
+        .map(|(prefix, _)| prefix.to_owned())
+}
+
+fn summarize_grouped_sequences(
+    name: &str,
+    confidence: &'static str,
+    base: &[OrderItem],
+    target: &[OrderItem],
+    group_for: fn(&OrderItem) -> Option<String>,
+    minimum_total: usize,
+) -> Vec<ScopedSequenceSummary> {
+    let mut base_groups: BTreeMap<String, Vec<OrderItem>> = BTreeMap::new();
+    let mut target_groups: BTreeMap<String, Vec<OrderItem>> = BTreeMap::new();
+    for item in base {
+        if let Some(group) = group_for(item) {
+            base_groups.entry(group).or_default().push(item.clone());
+        }
+    }
+    for item in target {
+        if let Some(group) = group_for(item) {
+            target_groups.entry(group).or_default().push(item.clone());
+        }
+    }
+    summarize_pre_grouped_sequences(name, confidence, base_groups, target_groups, minimum_total)
+}
+
+fn summarize_pre_grouped_sequences(
+    name: &str,
+    confidence: &'static str,
+    base_groups: BTreeMap<String, Vec<OrderItem>>,
+    target_groups: BTreeMap<String, Vec<OrderItem>>,
+    minimum_total: usize,
+) -> Vec<ScopedSequenceSummary> {
+    let groups: BTreeSet<String> = base_groups
+        .keys()
+        .chain(target_groups.keys())
+        .cloned()
+        .collect();
+    groups
+        .into_iter()
+        .filter_map(|scope| {
+            let base = base_groups.get(&scope).map(Vec::as_slice).unwrap_or(&[]);
+            let target = target_groups.get(&scope).map(Vec::as_slice).unwrap_or(&[]);
+            (base.len().max(target.len()) >= minimum_total).then(|| ScopedSequenceSummary {
+                scope,
+                comparison: summarize_sequence(compare_sequence(name, confidence, base, target)),
+            })
+        })
+        .collect()
+}
+
+fn summarize_sequence(comparison: SequenceComparison) -> SequenceSummary {
+    let different = sequence_differs(&comparison);
+    let SequenceComparison {
+        name,
+        confidence,
+        base_total,
+        target_total,
+        shared_unique,
+        order_metrics,
+        only_base,
+        only_target,
+        multiplicity,
+        excluded_nonunique,
+        changed,
+        moved,
+    } = comparison;
+    SequenceSummary {
+        name,
+        confidence,
+        different,
+        base_total,
+        target_total,
+        shared_unique,
+        order_metrics,
+        only_base: only_base.len(),
+        only_target: only_target.len(),
+        multiplicity: multiplicity.len(),
+        excluded_nonunique: excluded_nonunique.len(),
+        changed: changed.len(),
+        moved: moved.len(),
+    }
+}
+
+fn append_scoped_symbol_kinds(
+    destination: &mut BTreeMap<String, Vec<OrderItem>>,
+    scope_key: &str,
+    scope: &ModuleOrderScope,
+) {
+    for item in &scope.symbols {
+        let Some((kind, _)) = item.key.split_once('|') else {
+            continue;
+        };
+        destination
+            .entry(kind.to_owned())
+            .or_default()
+            .push(OrderItem {
+                key: format!("{scope_key}|{}", item.key),
+                value: format!("module={} {}", scope.value, item.value),
+                comparison_value: format!("{scope_key}|{}", item.comparison_value),
+            });
+    }
 }
 
 fn unique_module_scopes<'a>(
@@ -1045,8 +1223,32 @@ fn render_order_report(report: &OrderReport, limit: usize) -> String {
         "order evidence is reported by channel; physical/linker-derived order is diagnostic, not source-order proof"
     );
     render_sequence_comparison(&mut out, &report.modules, limit);
+    render_scoped_summaries(
+        &mut out,
+        "DBI order within individual libraries",
+        &report.module_library_sequences,
+        limit,
+    );
     render_sequence_comparison(&mut out, &report.named_types, limit);
+    render_scoped_summaries(
+        &mut out,
+        "TPI order by named-record kind",
+        &report.named_type_kinds,
+        limit,
+    );
     render_sequence_comparison(&mut out, &report.global_symbols, limit);
+    render_scoped_summaries(
+        &mut out,
+        "global-symbol order by kind",
+        &report.global_symbol_kinds,
+        limit,
+    );
+    render_scoped_summaries(
+        &mut out,
+        "module-local symbol order by kind (stable module-key order)",
+        &report.module_symbol_kinds,
+        limit,
+    );
     let _ = writeln!(
         out,
         "\n[module symbol scopes] paired={} different={} ambiguous={}",
@@ -1084,29 +1286,7 @@ fn render_sequence_comparison(out: &mut String, comparison: &SequenceComparison,
         comparison.multiplicity.len(),
         comparison.excluded_nonunique.len(),
     );
-    let adjacent_pairs = comparison.shared_unique.saturating_sub(1);
-    let inversion_percent = if comparison.order_metrics.comparable_pairs == 0 {
-        0.0
-    } else {
-        100.0 * comparison.order_metrics.inversions as f64
-            / comparison.order_metrics.comparable_pairs as f64
-    };
-    let _ = writeln!(
-        out,
-        "  locality: inversions={}/{} ({:.4}%) lis={}/{} adjacent={}/{} reversed-adjacent={} longest-contiguous={} increasing-runs={} displacement-sum={} displacement-max={}",
-        comparison.order_metrics.inversions,
-        comparison.order_metrics.comparable_pairs,
-        inversion_percent,
-        comparison.order_metrics.longest_ordered_subsequence,
-        comparison.shared_unique,
-        comparison.order_metrics.preserved_adjacent_pairs,
-        adjacent_pairs,
-        comparison.order_metrics.reversed_adjacent_pairs,
-        comparison.order_metrics.longest_contiguous_run,
-        comparison.order_metrics.increasing_runs,
-        comparison.order_metrics.rank_displacement_sum,
-        comparison.order_metrics.max_rank_displacement,
-    );
+    render_order_metrics(out, &comparison.order_metrics, comparison.shared_unique);
     for item in comparison.moved.iter().take(limit) {
         let _ = writeln!(
             out,
@@ -1139,6 +1319,95 @@ fn render_sequence_comparison(out: &mut String, comparison: &SequenceComparison,
             out,
             "  excluded from order pairing (non-unique key, base={} target={}): {}",
             item.base_count, item.target_count, item.value
+        );
+    }
+}
+
+fn render_order_metrics(out: &mut String, metrics: &OrderMetrics, shared_unique: usize) {
+    let adjacent_pairs = shared_unique.saturating_sub(1);
+    let inversion_percent = if metrics.comparable_pairs == 0 {
+        0.0
+    } else {
+        100.0 * metrics.inversions as f64 / metrics.comparable_pairs as f64
+    };
+    let _ = writeln!(
+        out,
+        "  locality: inversions={}/{} ({:.4}%) lis={}/{} adjacent={}/{} reversed-adjacent={} longest-contiguous={} increasing-runs={} displacement-sum={} displacement-max={}",
+        metrics.inversions,
+        metrics.comparable_pairs,
+        inversion_percent,
+        metrics.longest_ordered_subsequence,
+        shared_unique,
+        metrics.preserved_adjacent_pairs,
+        adjacent_pairs,
+        metrics.reversed_adjacent_pairs,
+        metrics.longest_contiguous_run,
+        metrics.increasing_runs,
+        metrics.rank_displacement_sum,
+        metrics.max_rank_displacement,
+    );
+}
+
+fn render_scoped_summaries(
+    out: &mut String,
+    title: &str,
+    summaries: &[ScopedSequenceSummary],
+    limit: usize,
+) {
+    let mut different: Vec<&ScopedSequenceSummary> = summaries
+        .iter()
+        .filter(|summary| summary.comparison.different)
+        .collect();
+    different.sort_by(|left, right| {
+        let ratio = |summary: &ScopedSequenceSummary| {
+            let metrics = &summary.comparison.order_metrics;
+            if metrics.comparable_pairs == 0 {
+                0.0
+            } else {
+                metrics.inversions as f64 / metrics.comparable_pairs as f64
+            }
+        };
+        ratio(right)
+            .partial_cmp(&ratio(left))
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| {
+                right
+                    .comparison
+                    .order_metrics
+                    .inversions
+                    .cmp(&left.comparison.order_metrics.inversions)
+            })
+            .then_with(|| left.scope.cmp(&right.scope))
+    });
+    let _ = writeln!(
+        out,
+        "\n[{title}] groups={} different={}",
+        summaries.len(),
+        different.len(),
+    );
+    for summary in different.iter().take(limit) {
+        let comparison = &summary.comparison;
+        let _ = writeln!(
+            out,
+            "  {}: base={} target={} shared-unique={} moved={} changed={} only-base={} only-target={} multiplicity={} excluded-nonunique={}",
+            summary.scope,
+            comparison.base_total,
+            comparison.target_total,
+            comparison.shared_unique,
+            comparison.moved,
+            comparison.changed,
+            comparison.only_base,
+            comparison.only_target,
+            comparison.multiplicity,
+            comparison.excluded_nonunique,
+        );
+        render_order_metrics(out, &comparison.order_metrics, comparison.shared_unique);
+    }
+    if different.len() > limit {
+        let _ = writeln!(
+            out,
+            "  ... {} more differing groups",
+            different.len() - limit
         );
     }
 }
@@ -3523,6 +3792,42 @@ mod tests {
         assert_eq!(singleton.order_metrics.longest_ordered_subsequence, 1);
         assert_eq!(singleton.order_metrics.longest_contiguous_run, 1);
         assert_eq!(singleton.order_metrics.increasing_runs, 1);
+    }
+
+    #[test]
+    fn grouped_order_summaries_isolate_cross_kind_interleaving() {
+        let base = [order_item("procedure|a"), order_item("data|b")];
+        let target = [order_item("data|b"), order_item("procedure|a")];
+        let whole = compare_sequence("test", "diagnostic", &base, &target);
+        assert_eq!(whole.order_metrics.inversions, 1);
+
+        let groups = summarize_grouped_sequences(
+            "test by kind",
+            "diagnostic",
+            &base,
+            &target,
+            key_prefix_group,
+            1,
+        );
+        assert_eq!(groups.len(), 2);
+        assert!(groups.iter().all(|group| !group.comparison.different));
+        assert!(
+            groups
+                .iter()
+                .all(|group| group.comparison.order_metrics.inversions == 0)
+        );
+    }
+
+    #[test]
+    fn module_library_groups_exclude_direct_link_objects() {
+        assert_eq!(
+            module_library_group(&order_item("sample.obj|engine.lib")),
+            Some("engine.lib".to_owned())
+        );
+        assert_eq!(
+            module_library_group(&order_item("sample.obj|sample.obj")),
+            None
+        );
     }
 
     #[test]
