@@ -78,7 +78,7 @@ struct Cli {
     show_identical: bool,
 
     /// Optional case-insensitive module/object/library substring. With --order,
-    /// emit only the focused DBI module sequence without loading other channels.
+    /// emit focused DBI module and local file/C13 sequences.
     #[arg(long)]
     module: Option<String>,
 
@@ -705,6 +705,19 @@ struct FocusedModuleOrderReport {
     target_sequence: Vec<OrderItem>,
     base_sequence: Vec<OrderItem>,
     modules: SequenceComparison,
+    dbi_source_file_streams: ScopedStreamReport,
+    module_file_streams: ScopedStreamReport,
+    module_line_streams: ScopedStreamReport,
+    module_subsection_streams: ScopedStreamReport,
+}
+
+#[derive(Default)]
+struct FocusedModuleOrderSide {
+    modules: Vec<OrderItem>,
+    dbi_source_files: Vec<ModuleOrderScope>,
+    module_files: Vec<ModuleOrderScope>,
+    module_lines: Vec<ModuleOrderScope>,
+    module_subsections: Vec<ModuleOrderScope>,
 }
 
 fn build_focused_module_order_report(
@@ -712,52 +725,113 @@ fn build_focused_module_order_report(
     base_pdb: &PathBuf,
     filter: &str,
 ) -> vostok_pdb_parser::Result<FocusedModuleOrderReport> {
-    let target_sequence = load_focused_module_order(target_pdb, filter)?;
-    let base_sequence = load_focused_module_order(base_pdb, filter)?;
+    let target = load_focused_module_order(target_pdb, filter)?;
+    let base = load_focused_module_order(base_pdb, filter)?;
     let modules = compare_sequence(
         "focused DBI module/object sequence",
         "semantic/linker-derived; filtered from serialized DBI module order",
-        &base_sequence,
-        &target_sequence,
+        &base.modules,
+        &target.modules,
     );
     Ok(FocusedModuleOrderReport {
         target_pdb: target_pdb.display().to_string(),
         base_pdb: base_pdb.display().to_string(),
         filter: filter.to_owned(),
-        target_sequence,
-        base_sequence,
+        target_sequence: target.modules,
+        base_sequence: base.modules,
         modules,
+        dbi_source_file_streams: compare_scoped_streams(
+            "DBI source-file references",
+            "semantic/compiler-derived within a linker-created module",
+            &base.dbi_source_files,
+            &target.dbi_source_files,
+        ),
+        module_file_streams: compare_scoped_streams(
+            "C13 file checksum records",
+            "semantic/compiler-emitted module-local order",
+            &base.module_files,
+            &target.module_files,
+        ),
+        module_line_streams: compare_scoped_streams(
+            "C13 line records",
+            "semantic/compiler-emitted module-local order",
+            &base.module_lines,
+            &target.module_lines,
+        ),
+        module_subsection_streams: compare_scoped_streams(
+            "C13 subsection records",
+            "physical module-stream serialization",
+            &base.module_subsections,
+            &target.module_subsections,
+        ),
     })
 }
 
 fn load_focused_module_order(
     pdb_path: &PathBuf,
     filter: &str,
-) -> vostok_pdb_parser::Result<Vec<OrderItem>> {
-    let file = std::fs::File::open(pdb_path)?;
-    let mut pdb = pdb::PDB::open(file)?;
-    let dbi = pdb.debug_information()?;
-    let mut modules = dbi.modules()?;
+) -> vostok_pdb_parser::Result<FocusedModuleOrderSide> {
+    let layout = MsfLayout::parse(pdb_path)?;
+    let mut dbi = load_raw_dbi_inventory(pdb_path, &layout)?;
     let needle = filter.to_lowercase();
-    let mut output = Vec::new();
-    while let Some(module) = modules.next()? {
-        let module_name = module.module_name().into_owned();
-        let object_file_name = module.object_file_name().into_owned();
-        if !module_order_matches_filter(&module_name, &object_file_name, &needle) {
-            continue;
-        }
-        let key = module_order_key(&module_name, &object_file_name);
-        output.push(OrderItem {
-            key: key.clone(),
-            value: format!("module={module_name} object={object_file_name}"),
-            comparison_value: key,
-        });
-    }
-    Ok(output)
+    dbi.modules
+        .retain(|module| module_order_item_matches_filter(&module.value, &needle));
+    let selected_keys: BTreeSet<&str> = dbi
+        .modules
+        .iter()
+        .map(|module| module.key.as_str())
+        .collect();
+    dbi.source_files
+        .retain(|scope| selected_keys.contains(scope.key.as_str()));
+    let global_names = load_global_names_by_offset(pdb_path, &layout)?;
+    let debug = load_module_debug_scopes(
+        pdb_path,
+        &layout,
+        &dbi,
+        &global_names,
+        &HashMap::new(),
+        &HashMap::new(),
+    )?;
+    Ok(FocusedModuleOrderSide {
+        modules: dbi
+            .modules
+            .iter()
+            .map(|module| OrderItem {
+                key: module.key.clone(),
+                value: module.value.clone(),
+                comparison_value: module.key.clone(),
+            })
+            .collect(),
+        dbi_source_files: dbi.source_files,
+        module_files: debug.files,
+        module_lines: debug.lines,
+        module_subsections: debug.subsections,
+    })
 }
 
-fn module_order_matches_filter(module_name: &str, object_file_name: &str, needle: &str) -> bool {
-    module_name.to_lowercase().contains(needle) || object_file_name.to_lowercase().contains(needle)
+fn module_order_item_matches_filter(value: &str, needle: &str) -> bool {
+    value.to_lowercase().contains(needle)
+}
+
+fn load_global_names_by_offset(
+    pdb_path: &PathBuf,
+    layout: &MsfLayout,
+) -> vostok_pdb_parser::Result<HashMap<usize, String>> {
+    let file = std::fs::File::open(pdb_path)?;
+    let mut pdb = pdb::PDB::open(file)?;
+    let info = pdb.pdb_information()?;
+    let names = info.stream_names()?;
+    let names_stream = names.iter().find_map(|named| {
+        named
+            .name
+            .to_string()
+            .eq_ignore_ascii_case("/names")
+            .then_some(u32::from(named.stream_id.0))
+    });
+    let Some(names_stream) = names_stream else {
+        return Ok(HashMap::new());
+    };
+    Ok(load_global_string_table(pdb_path, layout, names_stream)?.names_by_offset)
 }
 
 fn build_order_report(
@@ -4634,7 +4708,7 @@ fn render_focused_module_order_report(report: &FocusedModuleOrderReport, limit: 
     let _ = writeln!(out, "DBI module filter: {:?}", report.filter);
     let _ = writeln!(
         out,
-        "focused mode reads serialized DBI modules only; it does not imply source ownership"
+        "focused mode reads serialized DBI modules and their local file/C13 streams; it does not imply source ownership"
     );
     let _ = writeln!(out, "\n[target DBI module sequence]");
     for (position, item) in report.target_sequence.iter().enumerate() {
@@ -4645,6 +4719,30 @@ fn render_focused_module_order_report(report: &FocusedModuleOrderReport, limit: 
         let _ = writeln!(out, "  {position:>5}: {}", item.value);
     }
     render_sequence_comparison(&mut out, &report.modules, limit);
+    render_scoped_stream_report(
+        &mut out,
+        "focused DBI per-module source-file scopes",
+        &report.dbi_source_file_streams,
+        limit,
+    );
+    render_scoped_stream_report(
+        &mut out,
+        "focused C13 file-checksum scopes",
+        &report.module_file_streams,
+        limit,
+    );
+    render_scoped_stream_report(
+        &mut out,
+        "focused C13 line-program scopes",
+        &report.module_line_streams,
+        limit,
+    );
+    render_scoped_stream_report(
+        &mut out,
+        "focused C13 subsection scopes",
+        &report.module_subsection_streams,
+        limit,
+    );
     out
 }
 
@@ -7493,19 +7591,16 @@ mod tests {
 
     #[test]
     fn focused_module_filter_checks_module_and_container_paths() {
-        assert!(module_order_matches_filter(
-            "c:\\build\\vfs\\find.obj",
-            "c:\\build\\vostok_vfs.lib",
+        assert!(module_order_item_matches_filter(
+            "module=c:\\build\\vfs\\find.obj object=c:\\build\\vostok_vfs.lib",
             "vfs"
         ));
-        assert!(module_order_matches_filter(
-            "c:\\build\\core\\find.obj",
-            "c:\\build\\vostok_vfs.lib",
+        assert!(module_order_item_matches_filter(
+            "module=c:\\build\\core\\find.obj object=c:\\build\\vostok_vfs.lib",
             "vostok_vfs"
         ));
-        assert!(!module_order_matches_filter(
-            "c:\\build\\core\\find.obj",
-            "c:\\build\\vostok_core.lib",
+        assert!(!module_order_item_matches_filter(
+            "module=c:\\build\\core\\find.obj object=c:\\build\\vostok_core.lib",
             "vfs"
         ));
     }
